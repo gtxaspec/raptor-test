@@ -38,7 +38,7 @@ fails (`--keep-logs` keeps them always).
 |---|---|
 | Signaling | SDP structure, AAC `config=` internally consistent with the RTP clock (LC and backward-compatible HE-AAC v1 forms decoded bit-exactly) |
 | Transports | Clean media over TCP-interleaved and UDP, main and sub stream |
-| Wire level | RTP sequence continuity per track via a raw interleaved probe |
+| Wire level | RTP sequence continuity per track via a raw interleaved probe; RTP timestamp discipline: never backward, single-packet spikes triaged against wall-clock arrival (honest source gap vs timestamp anomaly), audio cadence modal share with nudge-direction split (one-sided = tracking a real source clock, two-sided = oscillating steering) |
 | Timestamps | Real capture: per-track monotonicity in native timebases, A/V end alignment; audio cadence vs nominal rate in ppm (catches source-clock drift) |
 | Content | Measured video fps vs nominal (within 15%), resolution sanity, decoded audio sample count vs declared rate (catches SBR/rate mislabels), GOP cadence from a raw bitstream census, per-frame SEI presence (raptor ST 0604; skipped when absent) |
 | RTSP behavior | PAUSE halts delivery and PLAY resumes; malformed requests (bogus path, garbage transport, unknown session) answered with 4xx and the server stays healthy |
@@ -49,12 +49,13 @@ fails (`--keep-logs` keeps them always).
 | RFC 3640 | AAC-hbr fmtp completeness |
 | RFC 3551/7587 | Per-codec audio conformance: G.711 static PT 0/8 at 8 kHz, Opus rtpmap `opus/48000/2`, L16 static PT only at 44.1 kHz (dynamic otherwise) |
 | Concurrency | Ladder of 2, 3, then 4 simultaneous clients on the main stream and 2/4 on the sub stream (alternating transports, every client individually verified); sustained UDP client stays clean across three join/leave cycles |
+| Deployed cameras | Established sessions are baselined before any suite traffic: clean refusals at `max_clients` with external viewers (an attached NVR) become capacity skips, the leak check compares against the baseline instead of zero, and single-digit UDP loss reports as wireless-grade rather than failing the regression guards |
 | Regression | Repeated default-transport ffprobe sessions (UDP dual-SETUP) followed by clean UDP media — guards the re-SETUP fd-leak and cross-wiring bug classes |
 | Players | mpv over TCP and UDP: error-free logs and A-V sync < 0.1s |
 | go2rtc | Clean media through a restream; AAC `config=` passed through verbatim |
 | Frigate | Dockerized Frigate records via TCP and UDP inputs; recorded clips verified |
-| Clips | Recorded files: streams present, durations aligned, full decode with zero errors |
-| Device | (`--ssh`) rsd CPU sane after the suite, no leaked connections |
+| Clips | Recorded files: streams present, durations aligned, full decode with zero errors (null-muxer dts nag and its repeat-tails excluded; file-level dts asserted to never move backward instead) |
+| Device | (`--ssh`) rsd CPU sane after the suite, connection count back at the pre-suite baseline |
 
 ## Design notes
 
@@ -82,6 +83,16 @@ fails (`--keep-logs` keeps them always).
   spikes, audio cadence stability) exist because a steering loop that
   bang-bangs +-1ms passes every decode check while file muxers
   silently drop packets around the jitter.
+
+## Codec and rate matrices
+
+The suite validates whatever the target is configured for. To sweep a
+raptor camera through its audio matrix (l16, pcmu, pcma, opus, aac at
+various rates), `tools/codec-matrix.sh user@cam /path/to/conf` edits
+the config over ssh, bounces rad+rsd from the NFS build, and runs the
+per-codec RFC probe, wire timestamp checks, and a decode against each
+combination. HW-validated matrix on T31: all five codecs conformant
+with exact wire cadence (G.711 modal 160, opus modal 960 at 100%).
 
 ## Not covered (yet)
 

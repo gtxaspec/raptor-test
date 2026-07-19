@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """RFC conformance probe: one TCP-interleaved RTSP session exercising
-RFC 2326 (RTSP), RFC 4566 (SDP), RFC 3550 (RTP/RTCP), RFC 3640 (AAC).
+RFC 2326 (RTSP), RFC 4566 (SDP), RFC 3550 (RTP/RTCP), RFC 3640 (AAC),
+RFC 3551 (static payload types: G.711, L16) and RFC 7587 (Opus).
 
 Emits one line per check: "OK <name> -- <detail>" or "FAIL <name> -- <detail>".
 Exit code 0 even on FAILs (the caller tallies); nonzero only on transport
