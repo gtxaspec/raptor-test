@@ -47,6 +47,7 @@ fails (`--keep-logs` keeps them always).
 | RFC 4566 | `o=` origin sanity, media sections, `a=control`, sprop parameter sets for H.26x |
 | RFC 3550 | Sender Reports present, compound with SDES CNAME, plausible NTP, sane cadence, cross-track NTP↔RTP mapping consistency (A/V skew), §5.1 nonzero initial seq/timestamp |
 | RFC 3640 | AAC-hbr fmtp completeness |
+| RFC 3551/7587 | Per-codec audio conformance: G.711 static PT 0/8 at 8 kHz, Opus rtpmap `opus/48000/2`, L16 static PT only at 44.1 kHz (dynamic otherwise) |
 | Concurrency | Ladder of 2, 3, then 4 simultaneous clients on the main stream and 2/4 on the sub stream (alternating transports, every client individually verified); sustained UDP client stays clean across three join/leave cycles |
 | Regression | Repeated default-transport ffprobe sessions (UDP dual-SETUP) followed by clean UDP media — guards the re-SETUP fd-leak and cross-wiring bug classes |
 | Players | mpv over TCP and UDP: error-free logs and A-V sync < 0.1s |

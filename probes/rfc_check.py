@@ -90,6 +90,37 @@ if "mpeg4-generic" in sdp.lower():
     needf = [k for k in ("sizelength=13", "indexlength=3", "indexdeltalength=3", "config=") if k not in fmtp]
     emit(not needf, "RFC3640 AAC-hbr fmtp complete", fmtp.strip() or "no fmtp")
 
+# -- Per-codec audio conformance (RFC 3551 static PTs, RFC 7587 Opus) --
+maudio = next((l for l in sdp.splitlines() if l.startswith("m=audio")), "")
+if maudio:
+    apt = maudio.split()[3] if len(maudio.split()) > 3 else ""
+    armap = next((l for l in sdp.splitlines()
+                  if l.startswith(f"a=rtpmap:{apt} ")), "")
+    enc = armap.split(" ", 1)[1] if " " in armap else ""
+    lo = enc.lower()
+    if apt in ("0", "8") or lo.startswith("pcmu") or lo.startswith("pcma"):
+        # Static PTs may omit rtpmap entirely (RFC 3551); when present
+        # it must agree with the PT and the fixed 8kHz clock.
+        want_enc = "pcmu" if (apt == "0" or lo.startswith("pcmu")) else "pcma"
+        want_pt = "0" if want_enc == "pcmu" else "8"
+        ok_pt = apt == want_pt and (not enc or (lo.startswith(want_enc) and "8000" in enc))
+        emit(ok_pt, "RFC3551 G.711 static payload type and 8kHz clock",
+             f"pt={apt} rtpmap={enc or '(static, none needed)'}")
+    elif lo.startswith("opus"):
+        emit(enc.strip().lower() == "opus/48000/2",
+             "RFC7587 opus rtpmap is opus/48000/2", enc)
+    elif lo.startswith("l16"):
+        parts = enc.split("/")
+        rate = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        ch = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+        if apt in ("10", "11"):
+            ok_l16 = rate == 44100 and ((apt == "10" and ch == 2) or (apt == "11" and ch == 1))
+            emit(ok_l16, "RFC3551 L16 static PT only valid at 44100Hz",
+                 f"pt={apt} rtpmap={enc}")
+        else:
+            emit(int(apt) >= 96 if apt.isdigit() else False,
+                 "RFC3551 L16 non-44.1k uses dynamic PT", f"pt={apt} rtpmap={enc}")
+
 # -- SETUP both tracks, PLAY, RTP-Info --
 sess = None
 head, _, _ = req("SETUP", url + "/video", "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n")
