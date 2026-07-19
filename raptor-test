@@ -1,0 +1,507 @@
+#!/bin/bash
+# raptor-test -- standalone live-stream conformance suite for RTSP
+# servers. Built for the Raptor Streaming System, works against any
+# RTSP source (generic checks self-skip when a feature is absent).
+#
+# Exercises what unit tests cannot: real sessions over TCP AND UDP,
+# multiple concurrent clients, join/leave churn, wire-level sequence
+# continuity, A/V timestamp sanity, and signaling byte-accuracy.
+# Every check exists because an ad-hoc test once missed the bug it
+# now catches.
+#
+# Usage:
+#   raptor-test <rtsp-url> [options]
+#
+# Options:
+#   --sub <url>        second stream URL (concurrency mix; default: main url)
+#   --ssh <user@host>  enable device-side health checks (raptor bench)
+#   --duration <s>     base capture duration (default 12)
+#   --go2rtc <apiurl>  test through a go2rtc restream (e.g. http://host:1984)
+#   --frigate          record via a local dockerized Frigate (both transports)
+#                      and verify the recorded clips
+#   --record-check <d> verify the newest .mp4 in a directory (e.g. rmr output)
+#   --keep-logs        keep the log directory even on success
+#
+# Requirements: ffmpeg+ffprobe (FFMPEG/FFPROBE env override), python3.
+# mpv used if present. All log matching is case-insensitive; failing
+# checks print the exact matched lines; logs persist on failure.
+# Background clients are killed via their own process tree -- never
+# kill only a timeout wrapper (orphaned ffmpeg streams forever).
+set -u
+
+URL=${1:?usage: raptor-test <rtsp-url> [--sub url] [--ssh user@host] [--duration s] [--keep-logs]}
+shift
+SUB_URL=""
+SSH_TARGET=""
+DUR=12
+KEEP=0
+GO2RTC=""
+FRIGATE=0
+RECDIR=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --sub) SUB_URL=$2; shift 2 ;;
+    --ssh) SSH_TARGET=$2; shift 2 ;;
+    --duration) DUR=$2; shift 2 ;;
+    --go2rtc) GO2RTC=$2; shift 2 ;;
+    --frigate) FRIGATE=1; shift ;;
+    --record-check) RECDIR=$2; shift 2 ;;
+    --keep-logs) KEEP=1; shift ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+    esac
+done
+[ -n "$SUB_URL" ] || SUB_URL=$URL
+
+HOSTPORT=${URL#rtsp://}
+HOSTPORT=${HOSTPORT%%/*}
+HOST=${HOSTPORT%%:*}
+PORT=${HOSTPORT##*:}
+[ "$PORT" = "$HOST" ] && PORT=554
+RPATH=/${URL#rtsp://*/}
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+PROBES="$DIR/probes"
+FFMPEG=${FFMPEG:-ffmpeg}
+FFPROBE=${FFPROBE:-ffprobe}
+WORK="./raptor-test-logs/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$WORK"
+PASS=0
+FAIL=0
+SKIP=0
+declare -a FAILED_NAMES
+
+# Error classes that mean broken media, matched case-insensitively.
+# 'non monotonically increasing dts to muxer' is deliberately absent:
+# -f null forces a 1/1000 timebase, so 30fps frames legally round to
+# equal milliseconds and the muxer nags. True timestamp monotonicity
+# is verified from a real capture in native timebases (section 4) and
+# on the wire (RFC probe).
+ERRPAT='missed|dropping|discontinuity|corrupt|concealing|invalid data|error while decoding'
+
+ok() { echo "  PASS  $1"; PASS=$((PASS + 1)); }
+skip() { echo "  SKIP  $1"; SKIP=$((SKIP + 1)); }
+bad() {
+    echo "  FAIL  $1${2:+ — $2}"
+    FAIL=$((FAIL + 1))
+    FAILED_NAMES+=("$1")
+}
+
+CLIENT_PIDS=""
+cleanup() {
+    for p in $CLIENT_PIDS; do
+        # Kill the wrapper AND its children (pkill -P), then the wrapper.
+        pkill -9 -P "$p" 2>/dev/null
+        kill -9 "$p" 2>/dev/null
+    done
+    [ "$KEEP" = 0 ] && [ "$FAIL" = 0 ] && rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+# show_errs <log> — print the matched error lines, indented.
+show_errs() { grep -iE "$ERRPAT" "$1" | sort | uniq -c | sort -rn | head -3 | sed 's/^/          /'; }
+
+# capture <name> <seconds> <url> [transport] — run a decoding client,
+# fail if any error-class line appears.
+capture() {
+    local name=$1 secs=$2 url=$3 transport=${4:-}
+    local targ=()
+    [ -n "$transport" ] && targ=(-rtsp_transport "$transport")
+    timeout -k 5 $((secs + 14)) "$FFMPEG" -nostdin -v warning "${targ[@]}" -i "$url" \
+        -t "$secs" -f null - >"$WORK/$name.log" 2>&1
+    [ "$(grep -ciE "$ERRPAT" "$WORK/$name.log")" -eq 0 ]
+}
+
+echo "=== raptor-test: $URL ==="
+echo "    logs: $WORK"
+
+# ── 1. Signaling (DESCRIBE) ──
+SDP=$(python3 - "$HOST" "$PORT" "$RPATH" <<'EOF'
+import socket, sys
+host, port, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+s = socket.create_connection((host, port), timeout=5)
+s.sendall(f"DESCRIBE rtsp://{host}:{port}{path} RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n\r\n".encode())
+buf = b""
+while len(buf) < 16384:
+    try:
+        d = s.recv(4096)
+    except socket.timeout:
+        break
+    if not d:
+        break
+    buf += d
+    if b"\r\n\r\n" in buf and b"Content-Length" in buf:
+        head, body = buf.split(b"\r\n\r\n", 1)
+        for line in head.split(b"\r\n"):
+            if line.lower().startswith(b"content-length"):
+                if len(body) >= int(line.split(b":")[1]):
+                    print(buf.decode(errors="replace"))
+                    sys.exit(0)
+print(buf.decode(errors="replace"))
+EOF
+)
+echo "$SDP" >"$WORK/sdp.txt"
+if echo "$SDP" | grep -q 'm=video'; then ok "SDP: video track present"; else bad "SDP: video track present"; fi
+
+CONFIG=$(echo "$SDP" | grep -o 'config=[0-9A-Fa-f]*' | head -1 | cut -d= -f2)
+ACLK=$(echo "$SDP" | grep -oiE 'mpeg4-generic/[0-9]+' | head -1 | cut -d/ -f2)
+if [ -n "$CONFIG" ] && [ -n "$ACLK" ]; then
+    if python3 - "$CONFIG" "$ACLK" <<'EOF'
+import sys
+cfg, aclk = sys.argv[1], int(sys.argv[2])
+rates = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350]
+b = bytes.fromhex(cfg)
+aot = b[0] >> 3
+if len(b) == 2 and aot == 2:  # plain LC
+    idx = ((b[0] & 0x7) << 1) | (b[1] >> 7)
+    sys.exit(0 if rates[idx] == aclk else 1)
+if len(b) == 5 and aot == 2:  # HE-AAC v1, backward-compatible explicit SBR
+    core = ((b[0] & 0x7) << 1) | (b[1] >> 7)
+    ext = (b[4] >> 3) & 0xF  # syncExtension extensionSamplingFrequencyIndex
+    sys.exit(0 if (rates[core] == aclk // 2 and rates[ext] == aclk) else 1)
+sys.exit(1)
+EOF
+    then ok "SDP: AAC config= consistent with clock ($CONFIG @ ${ACLK}Hz)"; else bad "SDP: AAC config= vs clock" "$CONFIG @ $ACLK"; fi
+else
+    skip "SDP AAC checks (no mpeg4-generic audio advertised)"
+fi
+
+# ── 2. Transport matrix ──
+if capture tcp_main "$DUR" "$URL" tcp; then ok "TCP: clean media (${DUR}s)"; else bad "TCP: clean media" "see below"; show_errs "$WORK/tcp_main.log"; fi
+if capture udp_main "$DUR" "$URL"; then ok "UDP: clean media (${DUR}s)"; else bad "UDP: clean media" "see below"; show_errs "$WORK/udp_main.log"; fi
+if [ "$SUB_URL" != "$URL" ]; then
+    if capture udp_sub "$DUR" "$SUB_URL"; then ok "UDP sub-stream: clean media"; else bad "UDP sub-stream" "see below"; show_errs "$WORK/udp_sub.log"; fi
+fi
+
+# ── 3. Wire-level RTP continuity (raw TCP-interleaved probe) ──
+GAPRPT=$(python3 "$PROBES/seq_gap.py" "$HOST" "$PORT" "$RPATH" 15 2>&1 | head -1)
+echo "$GAPRPT" >"$WORK/seqgap.txt"
+if echo "$GAPRPT" | grep -qE 'seq-lost=0.*seq-lost=0'; then
+    ok "RTP sequence continuity, both tracks (15s)"
+elif echo "$GAPRPT" | grep -qE 'seq-lost=0'; then
+    ok "RTP sequence continuity, video (no audio track)"
+else
+    bad "RTP sequence continuity" "$GAPRPT"
+fi
+
+# ── 4. A/V timestamps in a real capture ──
+timeout -k 5 $((DUR * 2 + 20)) "$FFMPEG" -nostdin -v quiet -rtsp_transport tcp -i "$URL" \
+    -c copy -t $((DUR * 2)) -y "$WORK/ts.mkv" 2>/dev/null
+VP=$("$FFPROBE" -v error -select_streams v -show_entries packet=pts_time -of csv=p=0 "$WORK/ts.mkv" 2>/dev/null | grep -vE 'N/A|^$' >"$WORK/v.pts"; wc -l <"$WORK/v.pts")
+AP=$("$FFPROBE" -v error -select_streams a -show_entries packet=pts_time -of csv=p=0 "$WORK/ts.mkv" 2>/dev/null | grep -vE 'N/A|^$' >"$WORK/a.pts"; wc -l <"$WORK/a.pts")
+if [ "$VP" -gt 30 ]; then
+    TSRES=$(python3 - "$WORK/v.pts" "$WORK/a.pts" <<'EOF'
+import sys
+v = [float(x) for x in open(sys.argv[1])]
+a = [float(x) for x in open(sys.argv[2])] if len(open(sys.argv[2]).read()) else []
+mono_v = all(y >= x for x, y in zip(v, v[1:]))
+if not a:
+    print(f"video-only mono={mono_v} v={len(v)}")
+    sys.exit(0 if mono_v else 1)
+mono_a = all(y >= x for x, y in zip(a, a[1:]))
+end_off = (a[-1] - v[-1]) * 1000
+print(f"end_offset={end_off:+.0f}ms mono_v={mono_v} mono_a={mono_a} v={len(v)} a={len(a)}")
+sys.exit(0 if (mono_v and mono_a and abs(end_off) < 500) else 1)
+EOF
+)
+    if [ $? -eq 0 ]; then ok "A/V capture timestamps ($TSRES)"; else bad "A/V capture timestamps" "$TSRES"; fi
+else
+    bad "A/V capture timestamps" "capture produced only $VP video packets"
+fi
+
+# ── 4b. Audio cadence/drift (nominal-rate check from the capture) ──
+if [ -n "$CONFIG" ] && [ "$AP" -gt 50 ]; then
+    FS=1024
+    [ ${#CONFIG} -ge 10 ] && FS=2048  # 5-byte BC-form ASC = HE-AAC, 2048/frame
+    DRIFT=$(python3 - "$WORK/a.pts" "$FS" "$ACLK" <<'EOF'
+import sys
+a = [float(x) for x in open(sys.argv[1])]
+fr = int(sys.argv[2]) / int(sys.argv[3])
+n = len(a)
+ppm = ((a[-1] - a[0]) / ((n - 1) * fr) - 1) * 1e6
+print(f"{ppm:+.0f}ppm over {a[-1]-a[0]:.0f}s ({n} pkts)")
+sys.exit(0 if abs(ppm) < 3000 else 1)
+EOF
+)
+    if [ $? -eq 0 ]; then ok "audio cadence vs nominal ($DRIFT)"; else bad "audio cadence drift" "$DRIFT"; fi
+else
+    skip "audio drift (no AAC or too few audio packets)"
+fi
+
+# ── 4c. RFC conformance (RFC 2326 / 4566 / 3550 / 3640) ──
+python3 "$PROBES/rfc_check.py" "$HOST" "$PORT" "$RPATH" 8 >"$WORK/rfc.txt" 2>&1
+while IFS= read -r line; do
+    case "$line" in
+    OK\ *) ok "${line#OK }" ;;
+    FAIL\ *) bad "${line#FAIL }" ;;
+    esac
+done <"$WORK/rfc.txt"
+
+# ── 5a. Concurrency ladder: 2 -> 3 -> 4 simultaneous clients ──
+# concurrent_check <label> <url> <n> <secs>: n clients (alternating
+# TCP/UDP) run together; every one of them must come back clean.
+concurrent_check() {
+    local label=$1 curl=$2 n=$3 secs=$4
+    local pids=() i
+    for i in $(seq 1 "$n"); do
+        local targ=()
+        [ $((i % 2)) -eq 1 ] && targ=(-rtsp_transport tcp)
+        timeout -k 5 $((secs + 14)) "$FFMPEG" -nostdin -v warning "${targ[@]}" -i "$curl"             -t "$secs" -f null - >"$WORK/conc_${label}_$i.log" 2>&1 &
+        pids+=($!)
+        CLIENT_PIDS="$CLIENT_PIDS $!"
+    done
+    local rc=0
+    for i in "${pids[@]}"; do wait "$i" 2>/dev/null; done
+    local total=0 c
+    for i in $(seq 1 "$n"); do
+        c=$(grep -ciE "$ERRPAT" "$WORK/conc_${label}_$i.log")
+        total=$((total + c))
+    done
+    if [ "$total" -eq 0 ]; then
+        ok "$n concurrent clients on $label: all clean (${secs}s)"
+    else
+        bad "$n concurrent clients on $label" "$total error lines total"
+        cat "$WORK"/conc_"${label}"_*.log | grep -iE "$ERRPAT" | sort | uniq -c | sort -rn | head -3 | sed 's/^/          /'
+    fi
+}
+for N in 2 3 4; do
+    concurrent_check main "$URL" "$N" 10
+done
+if [ "$SUB_URL" != "$URL" ]; then
+    concurrent_check sub "$SUB_URL" 2 10
+    concurrent_check sub "$SUB_URL" 4 10
+fi
+
+# ── 5b. Concurrency: sustained UDP client vs join/leave churn ──
+timeout -k 5 44 "$FFMPEG" -nostdin -v warning -i "$URL" -t 36 -f null - >"$WORK/sustained.log" 2>&1 &
+APID=$!
+CLIENT_PIDS="$CLIENT_PIDS $APID"
+sleep 6
+for joiner in "tcp $URL" "udp $URL" "udp $SUB_URL"; do
+    set -- $joiner
+    T=$1
+    JURL=$2
+    TARG=()
+    [ "$T" = tcp ] && TARG=(-rtsp_transport tcp)
+    timeout -k 3 10 "$FFMPEG" -nostdin -v quiet "${TARG[@]}" -i "$JURL" -t 7 -f null - >/dev/null 2>&1 &
+    CLIENT_PIDS="$CLIENT_PIDS $!"
+    sleep 9
+done
+wait $APID 2>/dev/null
+if [ "$(grep -ciE "$ERRPAT" "$WORK/sustained.log")" -eq 0 ]; then
+    ok "sustained UDP client clean across 3 join/leave cycles (36s)"
+else
+    bad "sustained client during joins" "see below"
+    show_errs "$WORK/sustained.log"
+fi
+
+# ── 6. Regression: repeated default-transport probe sessions, then media ──
+for i in 1 2 3; do
+    timeout -k 3 12 "$FFPROBE" -v quiet -show_streams "$URL" >/dev/null 2>&1
+done
+if capture udp_after_probes "$DUR" "$URL"; then
+    ok "UDP clean after 3x ffprobe (UDP dual-SETUP) sessions"
+else
+    bad "UDP after probe storm" "see below"
+    show_errs "$WORK/udp_after_probes.log"
+fi
+
+# ── 7. Device health (raptor bench, --ssh) ──
+if [ -n "$SSH_TARGET" ]; then
+    sleep 3
+    RSDLINE=$(ssh -o ConnectTimeout=8 "$SSH_TARGET" 'top -bn1' 2>/dev/null | grep -E '[r]sd -c' | head -1)
+    # busybox top: PID PPID USER STAT VSZ %VSZ CPU %CPU COMMAND
+    CPU=$(echo "$RSDLINE" | awk '{print $8}' | cut -d. -f1)
+    if [ -n "$CPU" ] && [ "$CPU" -ge 0 ] 2>/dev/null && [ "$CPU" -lt 20 ]; then
+        ok "rsd CPU sane post-suite (${CPU}%)"
+    else
+        bad "rsd CPU post-suite" "${RSDLINE:-no rsd process found}"
+    fi
+    NCONN=$(ssh -o ConnectTimeout=8 "$SSH_TARGET" "netstat -tn 2>/dev/null | grep -c :$PORT" 2>/dev/null)
+    if [ "${NCONN:-1}" -eq 0 ]; then ok "no leaked TCP connections"; else bad "leaked TCP connections" "$NCONN still open"; fi
+else
+    skip "device health (--ssh not given)"
+fi
+
+# ── 8. mpv: real player over both transports ──
+mpv_check() {
+    local name=$1 turl=$2
+    shift 2
+    mpv --no-config --vo=null --ao=null "$@" --length=10 "$turl" >"$WORK/$name.log" 2>&1
+    local errs
+    errs=$(tr '\r' '\n' <"$WORK/$name.log" | grep -ciE "$ERRPAT")
+    local av
+    av=$(tr '\r' '\n' <"$WORK/$name.log" | grep -oE 'A-V: *-?[0-9.]+' | tail -1 | grep -oE '[-0-9.]+$')
+    if [ "$errs" -gt 0 ]; then
+        bad "$name" "see below"
+        tr '\r' '\n' <"$WORK/$name.log" | grep -iE "$ERRPAT" | sort | uniq -c | sort -rn | head -3 | sed 's/^/          /'
+    elif [ -n "$av" ] && ! python3 -c "import sys; sys.exit(0 if abs(float('$av')) < 0.1 else 1)"; then
+        bad "$name" "A-V=${av}"
+    else
+        ok "$name (A-V=${av:-n/a})"
+    fi
+}
+if command -v mpv >/dev/null 2>&1; then
+    mpv_check "mpv TCP playback" "$URL" --rtsp-transport=tcp
+    mpv_check "mpv UDP playback" "$URL" --rtsp-transport=udp
+else
+    skip "mpv (not installed)"
+fi
+
+# clip_verify <name> <file> — a recorded clip must have sane streams,
+# matching durations, and decode with zero errors.
+clip_verify() {
+    local name=$1 f=$2
+    local slug
+    slug=$(echo "$name" | tr -c 'A-Za-z0-9._-' '_')
+    if [ ! -s "$f" ]; then
+        bad "$name" "no file"
+        return
+    fi
+    local info vdur adur
+    info=$("$FFPROBE" -v error -show_entries stream=codec_type,duration -of csv=p=0 "$f" 2>/dev/null)
+    vdur=$(echo "$info" | grep '^video' | cut -d, -f2 | cut -d. -f1)
+    adur=$(echo "$info" | grep '^audio' | cut -d, -f2 | cut -d. -f1)
+    "$FFMPEG" -nostdin -v error -i "$f" -f null - >"$WORK/$slug.decode.log" 2>&1
+    local derr
+    derr=$(grep -vi 'non monotonically increasing dts to muxer' "$WORK/$slug.decode.log" | grep -c .)
+    if [ -z "$vdur" ]; then
+        bad "$name" "no video stream"
+    elif [ "${derr:-1}" -gt 0 ]; then
+        bad "$name" "decode errors, see $WORK/$slug.decode.log"
+    elif [ -n "$adur" ] && [ $((vdur - adur)) -gt 1 -o $((adur - vdur)) -gt 1 ]; then
+        bad "$name" "duration mismatch v=${vdur}s a=${adur}s"
+    else
+        ok "$name (v=${vdur}s a=${adur:-none}s, decode clean)"
+    fi
+}
+
+# ── 9. go2rtc restream (--go2rtc) ──
+if [ -n "$GO2RTC" ]; then
+    G2NAME="raptortest$$"
+    ENC_URL=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$URL")
+    if curl -s -m 8 -X PUT "$GO2RTC/api/streams?name=$G2NAME&src=$ENC_URL" >/dev/null 2>&1; then
+        G2HOST=${GO2RTC#http://}
+        G2HOST=${G2HOST%%:*}
+        G2URL="rtsp://$G2HOST:8554/$G2NAME"
+        sleep 2
+        if timeout -k 5 $((DUR + 14)) "$FFMPEG" -nostdin -v warning -rtsp_transport tcp -i "$G2URL" -t "$DUR" -f null - >"$WORK/go2rtc.log" 2>&1             && [ "$(grep -ciE "$ERRPAT" "$WORK/go2rtc.log")" -eq 0 ]; then
+            ok "go2rtc restream: clean media (${DUR}s)"
+        else
+            bad "go2rtc restream" "see below"
+            show_errs "$WORK/go2rtc.log"
+        fi
+        if [ -n "$CONFIG" ]; then
+            G2SDP=$(python3 - "$G2HOST" 8554 "/$G2NAME" <<'EOF'
+import socket, sys
+host, port, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+s = socket.create_connection((host, port), timeout=5)
+s.sendall(f"DESCRIBE rtsp://{host}:{port}{path} RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n\r\n".encode())
+buf = b""
+import time
+t0 = time.time()
+while time.time() - t0 < 6 and len(buf) < 16384:
+    try:
+        d = s.recv(4096)
+    except socket.timeout:
+        break
+    if not d:
+        break
+    buf += d
+print(buf.decode(errors="replace"))
+EOF
+)
+            if echo "$G2SDP" | grep -qi "config=$CONFIG"; then
+                ok "go2rtc passes AAC config= through verbatim"
+            else
+                bad "go2rtc AAC config= passthrough" "origin $CONFIG not found in restream SDP"
+            fi
+        fi
+        curl -s -m 8 -X DELETE "$GO2RTC/api/streams?src=$G2NAME" >/dev/null 2>&1
+    else
+        bad "go2rtc API reachable" "$GO2RTC"
+    fi
+else
+    skip "go2rtc leg (--go2rtc not given)"
+fi
+
+# ── 10. Frigate record + clip verification (--frigate, docker) ──
+if [ "$FRIGATE" = 1 ]; then
+    if command -v docker >/dev/null 2>&1 && docker ps >/dev/null 2>&1; then
+        FDIR=$(mktemp -d)
+        mkdir -p "$FDIR/config" "$FDIR/media"
+        cat >"$FDIR/config/config.yml" <<EOF
+mqtt:
+  enabled: false
+cameras:
+  cam_tcp:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: $URL
+          roles: [record]
+      output_args:
+        record: preset-record-generic-audio-copy
+    record:
+      enabled: true
+      retain:
+        days: 1
+        mode: all
+    detect:
+      enabled: false
+  cam_udp:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: $URL
+          input_args: -avoid_negative_ts make_zero -fflags +genpts+discardcorrupt -timeout 5000000 -use_wallclock_as_timestamps 1
+          roles: [record]
+      output_args:
+        record: preset-record-generic-audio-copy
+    record:
+      enabled: true
+      retain:
+        days: 1
+        mode: all
+    detect:
+      enabled: false
+EOF
+        FNAME="raptor-test-frigate-$$"
+        docker run -d --name "$FNAME" --shm-size=128m             -v "$FDIR/config:/config" -v "$FDIR/media:/media/frigate"             ghcr.io/blakeblackshear/frigate:stable >/dev/null 2>&1
+        echo "  ....  frigate recording 75s (tcp + udp cameras)"
+        sleep 75
+        FERR=$(docker logs "$FNAME" 2>&1 | grep -ciE 'ffmpeg.*error|Unable to read|exceeded' )
+        for cam in cam_tcp cam_udp; do
+            SEG=$(ls -t "$FDIR"/media/recordings/*/*/"$cam"/*.mp4 2>/dev/null | sed -n 2p)
+            [ -z "$SEG" ] && SEG=$(ls -t "$FDIR"/media/recordings/*/*/"$cam"/*.mp4 2>/dev/null | head -1)
+            clip_verify "frigate $cam recorded clip" "$SEG"
+        done
+        if [ "${FERR:-0}" -eq 0 ]; then ok "frigate logs clean"; else bad "frigate logs" "$FERR error lines (docker logs $FNAME)"; fi
+        docker exec "$FNAME" sh -c 'rm -rf /media/frigate/recordings /media/frigate/clips' >/dev/null 2>&1
+        docker rm -f "$FNAME" >/dev/null 2>&1
+        rm -rf "$FDIR"
+    else
+        skip "frigate leg (docker unavailable)"
+    fi
+else
+    skip "frigate leg (--frigate not given)"
+fi
+
+# ── 11. Recorded-clip check for an external recorder (--record-check) ──
+if [ -n "$RECDIR" ]; then
+    # newest file is usually still being written; verify the previous one
+    NEWEST=$(find "$RECDIR" -name '*.mp4' -type f 2>/dev/null | xargs -r ls -t 2>/dev/null | sed -n 2p)
+    [ -z "$NEWEST" ] && NEWEST=$(find "$RECDIR" -name '*.mp4' -type f 2>/dev/null | xargs -r ls -t 2>/dev/null | head -1)
+    clip_verify "recorded clip ($RECDIR)" "$NEWEST"
+else
+    skip "external recording check (--record-check not given)"
+fi
+
+echo ""
+echo "=== RESULT: $PASS passed, $FAIL failed, $SKIP skipped ==="
+if [ "$FAIL" -gt 0 ]; then
+    printf '  failed: %s\n' "${FAILED_NAMES[@]}"
+    echo "  logs kept in: $WORK"
+    exit 1
+fi
+[ "$KEEP" = 1 ] && echo "  logs kept in: $WORK"
+exit 0
