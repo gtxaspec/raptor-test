@@ -1,0 +1,140 @@
+#!/bin/bash
+# run-battery -- run the full raptor-test battery consistently across
+# every backend a target exposes, from a targets/<name>.conf manifest.
+#
+# The point: the SAME comprehensive suite runs on every target and
+# every backend (rsd, rsd-555, SRT). Legs a target does not expose are
+# recorded as n/a, never silently dropped, so coverage cannot drift
+# between devices.
+#
+#   ./run-battery <target>        one target, all its backends
+#   ./run-battery --all           every targets/*.conf, then a matrix
+#   ./run-battery --list          list defined targets
+#
+# Bring-up (build/deploy/start daemons) is the caller's job — see
+# targets/README.md. This runs the tests, not the lab.
+set -u
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+TDIR="$DIR/targets"
+SUITE="$DIR/raptor-test"
+
+usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+list_targets() {
+    for f in "$TDIR"/*.conf; do
+        [ "$(basename "$f")" = "_template.conf" ] && continue
+        [ -e "$f" ] && basename "$f" .conf
+    done
+}
+
+[ $# -ge 1 ] || usage 1
+case "$1" in
+    -h|--help) usage 0 ;;
+    --list) list_targets; exit 0 ;;
+esac
+
+# One line of the final matrix per (target,backend): "target backend result"
+MATRIX_FILE=$(mktemp)
+trap 'rm -f "$MATRIX_FILE"' EXIT
+OVERALL_FAIL=0
+
+# run_suite <label> <url> [extra args...] — invoke raptor-test, echo a
+# live-tailed run, and append a parsed result row to the matrix.
+run_suite() {
+    local label=$1 url=$2
+    shift 2
+    echo
+    echo "################################################################"
+    echo "# $label"
+    echo "#   $url ${*}"
+    echo "################################################################"
+    local out
+    out=$("$SUITE" "$url" "$@" 2>&1)
+    echo "$out"
+    local res
+    res=$(echo "$out" | grep -oE '[0-9]+ passed, [0-9]+ failed, [0-9]+ skipped' | tail -1)
+    if [ -z "$res" ]; then
+        printf '%s\t%s\tERROR (no result line)\n' "$CURRENT_TARGET" "$label" >>"$MATRIX_FILE"
+        OVERALL_FAIL=1
+        return
+    fi
+    local failed
+    failed=$(echo "$res" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+')
+    printf '%s\t%s\t%s\n' "$CURRENT_TARGET" "$label" "$res" >>"$MATRIX_FILE"
+    [ "${failed:-1}" -ne 0 ] && OVERALL_FAIL=1
+    return 0
+}
+
+battery_for_target() {
+    local name=$1
+    local conf="$TDIR/$name.conf"
+    if [ ! -f "$conf" ]; then
+        echo "no such target: $name (see --list)" >&2
+        OVERALL_FAIL=1
+        return
+    fi
+    # Reset every field so a sparse conf can't inherit the previous
+    # target's values (matters for --all).
+    SOC=''; HOST=''; SSH=''; SRT=''; RHD=''; USER=''; PASS=''
+    RTSP_PORT=554; PATH0=stream0; PATH1=stream1
+    R555_PORT=''; R555_PATH0=stream0; R555_PATH1=stream1
+    GO2RTC=''; FRIGATE=no; RECORD_CHECK=''; NOTES=''
+    # shellcheck disable=SC1090
+    . "$conf"
+    CURRENT_TARGET=$name
+
+    echo "================================================================"
+    echo "TARGET $name  (SoC $SOC, host $HOST)"
+    [ -n "$NOTES" ] && echo "  $NOTES"
+    echo "================================================================"
+
+    # Shared optional legs, assembled once.
+    local -a common=()
+    [ -n "$SSH" ]          && common+=(--ssh "$SSH")
+    [ -n "$USER" ]         && common+=(--user "$USER" --pass "$PASS")
+    [ -n "$GO2RTC" ]       && common+=(--go2rtc "$GO2RTC")
+    [ "$FRIGATE" = yes ]   && common+=(--frigate)
+    [ -n "$RECORD_CHECK" ] && common+=(--record-check "$RECORD_CHECK")
+    [ -n "$RHD" ]          && common+=(--rhd "$RHD")
+
+    # Backend 1: rsd (compy) — carries the SRT leg too (SRT is a flag).
+    local -a rsd_args=("${common[@]}")
+    [ -n "$SRT" ] && rsd_args+=(--srt "$SRT")
+    run_suite "rsd (compy RTSP)" \
+        "rtsp://$HOST:$RTSP_PORT/$PATH0" \
+        --sub "rtsp://$HOST:$RTSP_PORT/$PATH1" "${rsd_args[@]}"
+
+    # Backend 2: rsd-555 (live555), if exposed. Reuse the common legs
+    # minus SRT/RHD (those are backend-independent, covered above).
+    if [ -n "$R555_PORT" ]; then
+        local -a r555_args=()
+        [ -n "$SSH" ]        && r555_args+=(--ssh "$SSH")
+        [ -n "$USER" ]       && r555_args+=(--user "$USER" --pass "$PASS")
+        [ -n "$GO2RTC" ]     && r555_args+=(--go2rtc "$GO2RTC")
+        [ "$FRIGATE" = yes ] && r555_args+=(--frigate)
+        run_suite "rsd-555 (live555 RTSP)" \
+            "rtsp://$HOST:$R555_PORT/$R555_PATH0" \
+            --sub "rtsp://$HOST:$R555_PORT/$R555_PATH1" "${r555_args[@]}"
+    else
+        printf '%s\t%s\tn/a\n' "$name" "rsd-555 (live555 RTSP)" >>"$MATRIX_FILE"
+    fi
+}
+
+if [ "$1" = "--all" ]; then
+    for t in $(list_targets); do battery_for_target "$t"; done
+else
+    battery_for_target "$1"
+fi
+
+echo
+echo "================================================================"
+echo "BATTERY MATRIX"
+echo "================================================================"
+printf '%-16s %-24s %s\n' TARGET BACKEND RESULT
+while IFS=$'\t' read -r t b r; do
+    printf '%-16s %-24s %s\n' "$t" "$b" "$r"
+done <"$MATRIX_FILE"
+echo
+[ "$OVERALL_FAIL" -eq 0 ] && echo "ALL BACKENDS CLEAN" || echo "SOME BACKENDS HAD FAILURES (review above)"
+exit "$OVERALL_FAIL"

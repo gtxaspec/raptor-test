@@ -11,7 +11,27 @@ RTP inspection, timestamp/drift math, RFC conformance, NVR recording,
 and recorded-clip verification. Every check exists because an ad-hoc
 test once missed the bug it now catches.
 
-## Usage
+## Running the whole battery on a target
+
+`raptor-test` checks one endpoint per invocation. To run the *entire*
+battery — every backend (rsd, rsd-555, SRT) and every leg — the same
+way on every device, use `run-battery` with a target manifest so
+coverage can't drift between targets:
+
+```sh
+./run-battery t23-cinnado      # one target, all its backends
+./run-battery --all            # every targets/*.conf, then a matrix
+./run-battery --list
+```
+
+Each `targets/<name>.conf` says where a device is and which backends
+and legs it exposes; `run-battery` runs raptor-test against each and
+prints a pass/fail matrix. Legs a target doesn't expose are marked
+`n/a`, never silently dropped. See `targets/README.md`. Bring-up
+(build, deploy, start the daemons) is the caller's job — the runner
+tests, it doesn't manage the lab.
+
+## Usage (single endpoint)
 
 ```sh
 ./raptor-test rtsp://CAM:9554/ch0 \
