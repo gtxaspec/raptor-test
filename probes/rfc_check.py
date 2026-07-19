@@ -35,9 +35,6 @@ except OSError as e:
 cseq = 0
 
 
-import struct
-
-
 def _skip_frames(buf):
     """Drop leading interleaved $-frames so RTSP headers parse clean."""
     while len(buf) >= 4 and buf[0:1] == b"$":
