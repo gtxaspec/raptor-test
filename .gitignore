@@ -1,1 +1,5 @@
+__pycache__/
+*.pyc
 raptor-test-logs/
+tools/ffmpeg
+tools/ffprobe

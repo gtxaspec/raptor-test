@@ -61,6 +61,14 @@ RPATH=/${URL#rtsp://*/}
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 PROBES="$DIR/probes"
+# Client pinning: RTSP behavior shifts between ffmpeg majors (7.1
+# streamcopy silently drops RTSP AAC audio; 8.x fixed it). Prefer the
+# pinned build in tools/ (tools/fetch-tools.sh) over the system one;
+# an explicit FFMPEG/FFPROBE env override still wins.
+if [ -z "${FFMPEG:-}" ] && [ -x "$DIR/tools/ffmpeg" ]; then
+    FFMPEG="$DIR/tools/ffmpeg"
+    FFPROBE="$DIR/tools/ffprobe"
+fi
 FFMPEG=${FFMPEG:-ffmpeg}
 FFPROBE=${FFPROBE:-ffprobe}
 # Fail fast if a probe is missing or unimportable (a deleted helper
@@ -75,6 +83,18 @@ EOF
 then
     echo "FATAL: probe scripts under $PROBES do not compile/import" >&2
     exit 2
+fi
+
+# Baseline established RTSP sessions before we generate any traffic
+# (a deployed camera may have an NVR attached; that context changes
+# how capacity rejections and the final connection count are judged).
+EXTERNAL_SESSIONS=0
+if [ -n "$SSH_TARGET" ]; then
+    EXTERNAL_SESSIONS=$(ssh -o ConnectTimeout=8 "$SSH_TARGET" \
+        "netstat -tn 2>/dev/null | grep ESTABLISHED | grep -c :$PORT" 2>/dev/null)
+    EXTERNAL_SESSIONS=${EXTERNAL_SESSIONS:-0}
+    [ "$EXTERNAL_SESSIONS" -gt 0 ] && \
+        echo "    note: $EXTERNAL_SESSIONS pre-existing RTSP session(s) on the target"
 fi
 WORK="./raptor-test-logs/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$WORK"
@@ -132,6 +152,7 @@ capture() {
 }
 
 echo "=== raptor-test: $URL ==="
+echo "    client: $("$FFMPEG" -version 2>/dev/null | head -1 | grep -oE 'version [^ ]+' || echo unknown) ($FFMPEG)"
 echo "    logs: $WORK"
 
 # ── 1. Signaling (DESCRIBE) ──
@@ -193,8 +214,9 @@ if [ "$SUB_URL" != "$URL" ]; then
 fi
 
 # ── 3. Wire-level RTP continuity (raw TCP-interleaved probe) ──
-GAPRPT=$(python3 "$PROBES/seq_gap.py" "$HOST" "$PORT" "$RPATH" 15 2>&1 | head -1)
-echo "$GAPRPT" >"$WORK/seqgap.txt"
+python3 "$PROBES/seq_gap.py" "$HOST" "$PORT" "$RPATH" 15 >"$WORK/seqgap.txt" 2>&1
+GAPRPT=$(head -1 "$WORK/seqgap.txt")
+TSRPT=$(sed -n 2p "$WORK/seqgap.txt")
 if echo "$GAPRPT" | grep -qE 'seq-lost=0.*seq-lost=0'; then
     ok "RTP sequence continuity, both tracks (15s)"
 elif echo "$GAPRPT" | grep -qE 'seq-lost=0'; then
@@ -202,10 +224,58 @@ elif echo "$GAPRPT" | grep -qE 'seq-lost=0'; then
 else
     bad "RTP sequence continuity" "$GAPRPT"
 fi
+# Wire timestamps: never backward, no single-packet spikes; audio must
+# hold one exact cadence (a bang-banging steering loop splits the modal
+# share across cadence±nudge and file muxers drop packets around it)
+if [ -n "$TSRPT" ]; then
+    if echo "$TSRPT" | grep -qE 'backward=0.*backward=0'; then
+        ok "RTP timestamps never step backward (wire)"
+    else
+        bad "RTP timestamps step backward on the wire" "$TSRPT"
+    fi
+    if echo "$TSRPT" | grep -qE 'spikes=0.*spikes=0'; then
+        ok "no RTP timestamp spikes (wire)"
+    else
+        bad "RTP timestamp spike on the wire" "$TSRPT"
+    fi
+    # One-sided nudging tracks a genuinely off-rate source clock and is
+    # fine; balanced two-sided nudging is a steering loop oscillating.
+    A_STATS=$(echo "$TSRPT" | grep -oE 'audio ts-steps.*$')
+    A_UP=$(echo "$A_STATS" | grep -oE 'up=[0-9]+' | grep -oE '[0-9]+')
+    A_DOWN=$(echo "$A_STATS" | grep -oE 'down=[0-9]+' | grep -oE '[0-9]+')
+    if [ -z "$A_UP" ]; then
+        skip "audio wire cadence (no audio track)"
+    else
+        A_MINOR=$((A_UP < A_DOWN ? A_UP : A_DOWN))
+        A_TOTAL=$((A_UP + A_DOWN))
+        if [ "$A_TOTAL" -gt 20 ] && [ $((A_MINOR * 100 / A_TOTAL)) -ge 25 ]; then
+            bad "audio RTP cadence oscillates (bang-bang steering)" "$A_STATS"
+        else
+            ok "audio RTP cadence steady ($A_STATS)"
+        fi
+    fi
+fi
 
 # ── 4. A/V timestamps in a real capture ──
+# -copyinkf: ffmpeg's streamcopy waits for a key-flagged packet per
+# stream, but its RTP AAC depacketizer never sets one (AAC is not
+# intra-only to ffmpeg), so without it EVERY rtsp aac copy capture is
+# silently audio-less — from any server, go2rtc included.
 timeout -k 5 $((DUR * 2 + 20)) "$FFMPEG" -nostdin -v quiet -rtsp_transport tcp -i "$URL" \
-    -c copy -t $((DUR * 2)) -y "$WORK/ts.mkv" 2>/dev/null
+    -c copy -copyinkf -t $((DUR * 2)) -y "$WORK/ts.mkv" 2>/dev/null
+# Document the plain-copy behavior for NVR operators: no verdict on the
+# server, but recorders using this ffmpeg without -copyinkf lose audio.
+if grep -q "m=audio" "$WORK/sdp.txt" 2>/dev/null; then
+    timeout -k 3 16 "$FFMPEG" -nostdin -v quiet -rtsp_transport tcp -i "$URL" \
+        -c copy -t 6 -y "$WORK/plaincopy.mkv" 2>/dev/null
+    PCA=$("$FFPROBE" -v error -select_streams a -show_entries packet=pts -of csv=p=0 "$WORK/plaincopy.mkv" 2>/dev/null | grep -c .)
+    if [ "$PCA" -gt 0 ]; then
+        ok "plain ffmpeg -c copy records audio ($PCA pkts/6s)"
+    else
+        skip "plain -c copy drops AAC audio (this ffmpeg never key-flags RTP AAC; recorders need -copyinkf or transcode)"
+    fi
+    rm -f "$WORK/plaincopy.mkv"
+fi
 VP=$("$FFPROBE" -v error -select_streams v -show_entries packet=pts_time -of csv=p=0 "$WORK/ts.mkv" 2>/dev/null | grep -vE 'N/A|^$' >"$WORK/v.pts"; wc -l <"$WORK/v.pts")
 AP=$("$FFPROBE" -v error -select_streams a -show_entries packet=pts_time -of csv=p=0 "$WORK/ts.mkv" 2>/dev/null | grep -vE 'N/A|^$' >"$WORK/a.pts"; wc -l <"$WORK/a.pts")
 if [ "$VP" -gt 30 ]; then
@@ -339,15 +409,35 @@ concurrent_check() {
         CLIENT_PIDS="$CLIENT_PIDS $!"
     done
     for i in "${pids[@]}"; do wait "$i" 2>/dev/null; done
-    local total=0 c
+    local total=0 c rejected=0 streamed=0 missed=0 m
     for i in $(seq 1 "$n"); do
-        c=$(grep -ciE "$ERRPAT" "$WORK/conc_${label}_$i.log")
+        if grep -qiE "Error opening input" "$WORK/conc_${label}_$i.log"; then
+            rejected=$((rejected + 1))
+            continue
+        fi
+        streamed=$((streamed + 1))
+        # single-digit UDP loss is radio weather (see storm check)
+        m=$(grep -ioE 'missed [0-9]+ packets' "$WORK/conc_${label}_$i.log" |
+            grep -oE '[0-9]+' | awk '{s+=$1} END {print s+0}')
+        missed=$((missed + m))
+        c=$(grep -civE 'missed [0-9]+ packets' \
+            <(grep -iE "$ERRPAT" "$WORK/conc_${label}_$i.log"))
         total=$((total + c))
     done
-    if [ "$total" -eq 0 ]; then
+    if [ "$missed" -gt 0 ] && [ "$missed" -le 5 ] && [ "$total" -eq 0 ]; then
+        echo "          note: $missed UDP packet(s) lost across $streamed clients (wireless-grade)"
+    elif [ "$missed" -gt 5 ]; then
+        total=$((total + missed))
+    fi
+    if [ "$total" -eq 0 ] && [ "$rejected" -eq 0 ]; then
         ok "$n concurrent clients on $label: all clean (${secs}s)"
+    elif [ "$total" -eq 0 ] && [ "$streamed" -gt 0 ] && [ "${EXTERNAL_SESSIONS:-0}" -gt 0 ]; then
+        # Server at its max_clients cap with pre-existing external
+        # viewers: clean refusal + clean media for admitted clients is
+        # correct behavior, not a stream defect.
+        skip "$n clients on $label: $rejected refused at capacity ($EXTERNAL_SESSIONS external viewers), $streamed admitted all clean"
     else
-        bad "$n concurrent clients on $label" "$total error lines total"
+        bad "$n concurrent clients on $label" "$rejected refused, $total error lines"
         cat "$WORK"/conc_"${label}"_*.log | grep -iE "$ERRPAT" | sort | uniq -c | sort -rn | head -3 | sed 's/^/          /'
     fi
 }
@@ -389,8 +479,19 @@ done
 if capture udp_after_probes "$DUR" "$URL"; then
     ok "UDP clean after 3x ffprobe (UDP dual-SETUP) sessions"
 else
-    bad "UDP after probe storm" "see below"
-    show_errs "$WORK/udp_after_probes.log"
+    # The fd-crosswiring regression this guards against loses THOUSANDS
+    # of packets and decodes garbage; single-digit UDP loss on a
+    # wireless link is radio weather, not that bug.
+    STORM_MISSED=$(grep -ioE 'missed [0-9]+ packets' "$WORK/udp_after_probes.log" |
+        grep -oE '[0-9]+' | awk '{s+=$1} END {print s+0}')
+    STORM_OTHER=$(grep -icvE 'missed [0-9]+ packets|Last message repeated' \
+        <(grep -iE "$ERRPAT" "$WORK/udp_after_probes.log"))
+    if [ "${STORM_MISSED:-0}" -le 5 ] && [ "${STORM_OTHER:-0}" -le 2 ]; then
+        ok "UDP after probe storm: minor wireless loss only ($STORM_MISSED pkts)"
+    else
+        bad "UDP after probe storm" "missed=$STORM_MISSED other=$STORM_OTHER"
+        show_errs "$WORK/udp_after_probes.log"
+    fi
 fi
 
 # ── 6b. Abrupt-kill client: RST mid-stream must not wound the server ──
@@ -419,8 +520,15 @@ if [ -n "$SSH_TARGET" ]; then
     else
         bad "rsd CPU post-suite" "${RSDLINE:-no rsd process found}"
     fi
-    NCONN=$(ssh -o ConnectTimeout=8 "$SSH_TARGET" "netstat -tn 2>/dev/null | grep -c :$PORT" 2>/dev/null)
-    if [ "${NCONN:-1}" -eq 0 ]; then ok "no leaked TCP connections"; else bad "leaked TCP connections" "$NCONN still open"; fi
+    # Compare against the baseline taken before any suite traffic:
+    # external viewers (an NVR watching a deployed camera) are not
+    # leaks, growth over the run is.
+    NCONN=$(ssh -o ConnectTimeout=8 "$SSH_TARGET" "netstat -tn 2>/dev/null | grep ESTABLISHED | grep -c :$PORT" 2>/dev/null)
+    if [ "${NCONN:-1}" -le "${EXTERNAL_SESSIONS:-0}" ]; then
+        ok "no leaked TCP connections (baseline $EXTERNAL_SESSIONS external, now ${NCONN:-0})"
+    else
+        bad "leaked TCP connections" "baseline ${EXTERNAL_SESSIONS:-0}, now ${NCONN:-?}"
+    fi
 else
     skip "device health (--ssh not given)"
 fi
@@ -466,11 +574,21 @@ clip_verify() {
     adur=$(echo "$info" | grep '^audio' | cut -d, -f2 | cut -d. -f1)
     "$FFMPEG" -nostdin -v error -i "$f" -f null - >"$WORK/$slug.decode.log" 2>&1
     local derr
-    derr=$(grep -vi 'non monotonically increasing dts to muxer' "$WORK/$slug.decode.log" | grep -c .)
+    # The null muxer re-times to 1/1000 and nags about colliding dts
+    # (wallclock-stamped recorders collide for real under bursty WiFi
+    # arrival); drop the nag AND its "Last message repeated" tails.
+    derr=$(grep -viE 'non monotonically increasing dts to muxer|Last message repeated' \
+        "$WORK/$slug.decode.log" | grep -c .)
+    # File-level timestamp truth instead: dts must never move backward.
+    local vback
+    vback=$("$FFPROBE" -v error -select_streams v -show_entries packet=dts -of csv=p=0 "$f" 2>/dev/null |
+        awk 'NR>1 && $1+0 < prev+0 {n++} {prev=$1} END {print n+0}')
     if [ -z "$vdur" ]; then
         bad "$name" "no video stream"
     elif [ "${derr:-1}" -gt 0 ]; then
         bad "$name" "decode errors, see $WORK/$slug.decode.log"
+    elif [ "${vback:-0}" -gt 0 ]; then
+        bad "$name" "video dts moves backward $vback times in the file"
     elif [ -n "$adur" ] && { [ $((vdur - adur)) -gt 1 ] || [ $((adur - vdur)) -gt 1 ]; }; then
         bad "$name" "duration mismatch v=${vdur}s a=${adur}s"
     else

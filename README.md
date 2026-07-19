@@ -22,8 +22,13 @@ test once missed the bug it now catches.
     --record-check /path/to/recordings   # verify an external recorder's newest clip
 ```
 
-Requires `ffmpeg`/`ffprobe` (override via `FFMPEG`/`FFPROBE` env) and
-`python3`; uses `mpv` and `docker` when present. Logs land in
+Requires `ffmpeg`/`ffprobe` and `python3`; uses `mpv` and `docker`
+when present. Run `tools/fetch-tools.sh` once to pin an official
+ffmpeg 8 static build in `tools/` -- the suite prefers it over the
+system ffmpeg (client RTSP behavior shifts between majors: 7.1
+streamcopy silently drops RTSP AAC audio, 8.x fixed it). An explicit
+`FFMPEG`/`FFPROBE` env override still wins, and every run logs the
+client version it used. Logs land in
 `./raptor-test-logs/<timestamp>/` and are kept whenever anything
 fails (`--keep-logs` keeps them always).
 
@@ -67,6 +72,15 @@ fails (`--keep-logs` keeps them always).
 - ffprobe with no transport flag intentionally probes over UDP with a
   dual-track SETUP: that exact traffic shape found two real server
   bugs the day this suite was written.
+- Copy captures use `-copyinkf`: ffmpeg's streamcopy waits for a
+  key-flagged packet per stream, but its RTP AAC depacketizer never
+  emits one (AAC is not intra-only to ffmpeg), so a plain `-c copy`
+  from ANY rtsp server -- go2rtc included -- silently records no
+  audio. A dedicated check documents the plain-copy behavior.
+- Wire-level RTP timestamp checks (backward steps, single-packet
+  spikes, audio cadence stability) exist because a steering loop that
+  bang-bangs +-1ms passes every decode check while file muxers
+  silently drop packets around the jitter.
 
 ## Not covered (yet)
 
