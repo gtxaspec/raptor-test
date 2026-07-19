@@ -35,11 +35,14 @@ fails (`--keep-logs` keeps them always).
 | Transports | Clean media over TCP-interleaved and UDP, main and sub stream |
 | Wire level | RTP sequence continuity per track via a raw interleaved probe |
 | Timestamps | Real capture: per-track monotonicity in native timebases, A/V end alignment; audio cadence vs nominal rate in ppm (catches source-clock drift) |
+| Content | Measured video fps vs nominal (within 15%), resolution sanity, decoded audio sample count vs declared rate (catches SBR/rate mislabels), GOP cadence from a raw bitstream census, per-frame SEI presence (raptor ST 0604; skipped when absent) |
+| RTSP behavior | PAUSE halts delivery and PLAY resumes; malformed requests (bogus path, garbage transport, unknown session) answered with 4xx and the server stays healthy |
+| Fault injection | Abruptly killed client (RST mid-stream) followed by clean media for the next client |
 | RFC 2326 | OPTIONS Public methods, DESCRIBE/SETUP/PLAY/TEARDOWN status codes, Session header, GET_PARAMETER keepalive, RTP-Info anchors matching the first actual packets |
 | RFC 4566 | `o=` origin sanity, media sections, `a=control`, sprop parameter sets for H.26x |
 | RFC 3550 | Sender Reports present, compound with SDES CNAME, plausible NTP, sane cadence, cross-track NTP↔RTP mapping consistency (A/V skew), §5.1 nonzero initial seq/timestamp |
 | RFC 3640 | AAC-hbr fmtp completeness |
-| Concurrency | Sustained UDP client stays clean across three join/leave cycles (TCP and UDP joiners, both streams) |
+| Concurrency | Ladder of 2, 3, then 4 simultaneous clients on the main stream and 2/4 on the sub stream (alternating transports, every client individually verified); sustained UDP client stays clean across three join/leave cycles |
 | Regression | Repeated default-transport ffprobe sessions (UDP dual-SETUP) followed by clean UDP media — guards the re-SETUP fd-leak and cross-wiring bug classes |
 | Players | mpv over TCP and UDP: error-free logs and A-V sync < 0.1s |
 | go2rtc | Clean media through a restream; AAC `config=` passed through verbatim |
@@ -64,3 +67,10 @@ fails (`--keep-logs` keeps them always).
 - ffprobe with no transport flag intentionally probes over UDP with a
   dual-track SETUP: that exact traffic shape found two real server
   bugs the day this suite was written.
+
+## Not covered (yet)
+
+Session-timeout reaping (needs a 60s idle wait), RTSPS/TLS and
+authenticated sessions, backchannel audio, and multi-hour soak runs.
+Candidates for a `--soak` mode. The raptor provenance suite separately
+covers snapshots, EXIF, signing, and rverify chains.

@@ -63,6 +63,19 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 PROBES="$DIR/probes"
 FFMPEG=${FFMPEG:-ffmpeg}
 FFPROBE=${FFPROBE:-ffprobe}
+# Fail fast if a probe is missing or unimportable (a deleted helper
+# module once surfaced as a mid-run traceback instead)
+if ! python3 - "$PROBES" <<'EOF'
+import pathlib, py_compile, sys
+for p in sorted(pathlib.Path(sys.argv[1]).glob("*.py")):
+    py_compile.compile(str(p), doraise=True)
+sys.path.insert(0, sys.argv[1])
+import rtsplib  # noqa: F401  (shared helper the probes import)
+EOF
+then
+    echo "FATAL: probe scripts under $PROBES do not compile/import" >&2
+    exit 2
+fi
 WORK="./raptor-test-logs/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$WORK"
 PASS=0
@@ -87,12 +100,19 @@ bad() {
 }
 
 CLIENT_PIDS=""
+FRIGATE_NAME=""
+FRIGATE_DIR=""
 cleanup() {
     for p in $CLIENT_PIDS; do
         # Kill the wrapper AND its children (pkill -P), then the wrapper.
         pkill -9 -P "$p" 2>/dev/null
         kill -9 "$p" 2>/dev/null
     done
+    if [ -n "$FRIGATE_NAME" ]; then
+        docker exec "$FRIGATE_NAME" sh -c 'rm -rf /media/frigate/recordings /media/frigate/clips' >/dev/null 2>&1
+        docker rm -f "$FRIGATE_NAME" >/dev/null 2>&1
+    fi
+    [ -n "$FRIGATE_DIR" ] && rm -rf "$FRIGATE_DIR"
     [ "$KEEP" = 0 ] && [ "$FAIL" = 0 ] && rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -227,7 +247,76 @@ else
     skip "audio drift (no AAC or too few audio packets)"
 fi
 
-# ── 4c. RFC conformance (RFC 2326 / 4566 / 3550 / 3640) ──
+# ── 4c. Decoded-content validation ──
+if [ "$VP" -gt 30 ]; then
+    VMETA=$("$FFPROBE" -v error -select_streams v -show_entries stream=width,height,r_frame_rate -of csv=p=0 "$WORK/ts.mkv" 2>/dev/null | head -1)
+    W=$(echo "$VMETA" | cut -d, -f1)
+    H=$(echo "$VMETA" | cut -d, -f2)
+    NOMFPS=$(echo "$VMETA" | cut -d, -f3)
+    FPSRES=$(python3 - "$WORK/v.pts" "$NOMFPS" <<'EOF'
+import sys
+v = [float(x) for x in open(sys.argv[1])]
+num, den = (sys.argv[2].split("/") + ["1"])[:2]
+nom = float(num) / float(den or 1)
+meas = (len(v) - 1) / (v[-1] - v[0])
+print(f"measured {meas:.2f}fps vs nominal {nom:.2f}")
+sys.exit(0 if nom > 0 and abs(meas - nom) / nom < 0.15 else 1)
+EOF
+)
+    if [ $? -eq 0 ]; then ok "video frame rate ($FPSRES)"; else bad "video frame rate" "$FPSRES"; fi
+    if [ "${W:-0}" -ge 160 ] && [ "${H:-0}" -ge 120 ]; then
+        ok "video resolution sane (${W}x${H})"
+    else
+        bad "video resolution" "${W}x${H}"
+    fi
+fi
+if [ "$AP" -gt 30 ]; then
+    ARATE=$("$FFPROBE" -v error -select_streams a -show_entries stream=sample_rate,channels -of csv=p=0 "$WORK/ts.mkv" 2>/dev/null | head -1)
+    AR=$(echo "$ARATE" | cut -d, -f1)
+    ACH=$(echo "$ARATE" | cut -d, -f2)
+    ABYTES=$(timeout 60 "$FFMPEG" -nostdin -v quiet -i "$WORK/ts.mkv" -map a -f s16le - 2>/dev/null | wc -c)
+    SAMPRES=$(python3 - "$WORK/a.pts" "$ABYTES" "${AR:-0}" "${ACH:-1}" <<'EOF'
+import sys
+a = [float(x) for x in open(sys.argv[1])]
+span = a[-1] - a[0]
+got = int(sys.argv[2]) // (2 * int(sys.argv[4]))
+want = int(sys.argv[3]) * span
+print(f"decoded {got} samples vs {want:.0f} expected over {span:.0f}s")
+sys.exit(0 if want > 0 and abs(got - want) / want < 0.1 else 1)
+EOF
+)
+    if [ $? -eq 0 ]; then ok "audio decodes at declared rate ($SAMPRES)"; else bad "audio decoded sample count" "$SAMPRES"; fi
+fi
+
+# Raw elementary stream: GOP cadence + per-frame SEI presence
+VCODEC=$("$FFPROBE" -v error -select_streams v -show_entries stream=codec_name -of csv=p=0 "$WORK/ts.mkv" 2>/dev/null | head -1)
+case "$VCODEC" in
+h264) RAWFMT=h264 CEN=h264 ;;
+hevc) RAWFMT=hevc CEN=h265 ;;
+*) RAWFMT="" ;;
+esac
+if [ -n "$RAWFMT" ]; then
+    timeout -k 5 24 "$FFMPEG" -nostdin -v quiet -rtsp_transport tcp -i "$URL" -map 0:v -c copy -t 15 -f "$RAWFMT" -y "$WORK/raw.es" 2>/dev/null
+    CENSUS=$(python3 "$PROBES/nal_census.py" "$WORK/raw.es" "$CEN")
+    echo "$CENSUS" >"$WORK/census.txt"
+    IDRN=$(echo "$CENSUS" | grep -o 'idr=[0-9]*' | cut -d= -f2)
+    VCLN=$(echo "$CENSUS" | grep -o 'vcl=[0-9]*' | cut -d= -f2)
+    SEIN=$(echo "$CENSUS" | grep -o 'sei=[0-9]*' | cut -d= -f2)
+    if [ "${IDRN:-0}" -ge 2 ]; then
+        ok "GOP cadence: $IDRN keyframes in 15s ($CENSUS)"
+    else
+        bad "GOP cadence" "$CENSUS — a joiner may wait forever for a keyframe"
+    fi
+    if [ "${SEIN:-0}" -ge $((VCLN * 9 / 10)) ] && [ "${VCLN:-0}" -gt 0 ]; then
+        ok "per-frame SEI present (${SEIN}/${VCLN} frames)"
+    elif [ "${SEIN:-0}" -eq 0 ]; then
+        skip "per-frame SEI (none in stream — raptor sei_timecode off or non-raptor server)"
+    else
+        bad "per-frame SEI coverage" "$SEIN of $VCLN frames"
+    fi
+fi
+
+# ── 4d. RFC conformance (RFC 2326 / 4566 / 3550 / 3640) ──
 python3 "$PROBES/rfc_check.py" "$HOST" "$PORT" "$RPATH" 8 >"$WORK/rfc.txt" 2>&1
 while IFS= read -r line; do
     case "$line" in
@@ -249,7 +338,6 @@ concurrent_check() {
         pids+=($!)
         CLIENT_PIDS="$CLIENT_PIDS $!"
     done
-    local rc=0
     for i in "${pids[@]}"; do wait "$i" 2>/dev/null; done
     local total=0 c
     for i in $(seq 1 "$n"); do
@@ -303,6 +391,21 @@ if capture udp_after_probes "$DUR" "$URL"; then
 else
     bad "UDP after probe storm" "see below"
     show_errs "$WORK/udp_after_probes.log"
+fi
+
+# ── 6b. Abrupt-kill client: RST mid-stream must not wound the server ──
+timeout -k 3 20 "$FFMPEG" -nostdin -v quiet -rtsp_transport tcp -i "$URL" -f null - >/dev/null 2>&1 &
+KPID=$!
+CLIENT_PIDS="$CLIENT_PIDS $KPID"
+sleep 4
+pkill -9 -P "$KPID" 2>/dev/null
+kill -9 "$KPID" 2>/dev/null
+sleep 2
+if capture after_kill 8 "$URL" tcp; then
+    ok "clean media after an abruptly killed client"
+else
+    bad "media after abrupt client kill" "see below"
+    show_errs "$WORK/after_kill.log"
 fi
 
 # ── 7. Device health (raptor bench, --ssh) ──
@@ -368,7 +471,7 @@ clip_verify() {
         bad "$name" "no video stream"
     elif [ "${derr:-1}" -gt 0 ]; then
         bad "$name" "decode errors, see $WORK/$slug.decode.log"
-    elif [ -n "$adur" ] && [ $((vdur - adur)) -gt 1 -o $((adur - vdur)) -gt 1 ]; then
+    elif [ -n "$adur" ] && { [ $((vdur - adur)) -gt 1 ] || [ $((adur - vdur)) -gt 1 ]; }; then
         bad "$name" "duration mismatch v=${vdur}s a=${adur}s"
     else
         ok "$name (v=${vdur}s a=${adur:-none}s, decode clean)"
@@ -428,6 +531,7 @@ fi
 if [ "$FRIGATE" = 1 ]; then
     if command -v docker >/dev/null 2>&1 && docker ps >/dev/null 2>&1; then
         FDIR=$(mktemp -d)
+        FRIGATE_DIR=$FDIR
         mkdir -p "$FDIR/config" "$FDIR/media"
         cat >"$FDIR/config/config.yml" <<EOF
 mqtt:
@@ -466,6 +570,7 @@ cameras:
       enabled: false
 EOF
         FNAME="raptor-test-frigate-$$"
+        FRIGATE_NAME=$FNAME
         docker run -d --name "$FNAME" --shm-size=128m             -v "$FDIR/config:/config" -v "$FDIR/media:/media/frigate"             ghcr.io/blakeblackshear/frigate:stable >/dev/null 2>&1
         echo "  ....  frigate recording 75s (tcp + udp cameras)"
         sleep 75
@@ -479,6 +584,8 @@ EOF
         docker exec "$FNAME" sh -c 'rm -rf /media/frigate/recordings /media/frigate/clips' >/dev/null 2>&1
         docker rm -f "$FNAME" >/dev/null 2>&1
         rm -rf "$FDIR"
+        FRIGATE_NAME=""
+        FRIGATE_DIR=""
     else
         skip "frigate leg (docker unavailable)"
     fi
@@ -489,8 +596,8 @@ fi
 # ── 11. Recorded-clip check for an external recorder (--record-check) ──
 if [ -n "$RECDIR" ]; then
     # newest file is usually still being written; verify the previous one
-    NEWEST=$(find "$RECDIR" -name '*.mp4' -type f 2>/dev/null | xargs -r ls -t 2>/dev/null | sed -n 2p)
-    [ -z "$NEWEST" ] && NEWEST=$(find "$RECDIR" -name '*.mp4' -type f 2>/dev/null | xargs -r ls -t 2>/dev/null | head -1)
+    NEWEST=$(find "$RECDIR" -name '*.mp4' -type f -print0 2>/dev/null | xargs -0 -r ls -t 2>/dev/null | sed -n 2p)
+    [ -z "$NEWEST" ] && NEWEST=$(find "$RECDIR" -name '*.mp4' -type f -print0 2>/dev/null | xargs -0 -r ls -t 2>/dev/null | head -1)
     clip_verify "recorded clip ($RECDIR)" "$NEWEST"
 else
     skip "external recording check (--record-check not given)"

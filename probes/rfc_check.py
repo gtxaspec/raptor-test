@@ -30,12 +30,28 @@ except OSError as e:
 cseq = 0
 
 
+import struct
+
+
+def _skip_frames(buf):
+    """Drop leading interleaved $-frames so RTSP headers parse clean."""
+    while len(buf) >= 4 and buf[0:1] == b"$":
+        ln = struct.unpack(">H", buf[2:4])[0]
+        if len(buf) < 4 + ln:
+            break
+        buf = buf[4 + ln:]
+    return buf
+
+
 def req(method, u, extra=""):
     global cseq
     cseq += 1
     s.sendall(f"{method} {u} RTSP/1.0\r\nCSeq: {cseq}\r\nUser-Agent: raptor-test\r\n{extra}\r\n".encode())
     buf = b""
-    while b"\r\n\r\n" not in buf:
+    while True:
+        buf = _skip_frames(buf)
+        if b"\r\n\r\n" in buf and not buf.startswith(b"$"):
+            break
         d = s.recv(4096)
         if not d:
             return "", "", b""
@@ -80,7 +96,6 @@ head, _, _ = req("SETUP", url + "/video", "Transport: RTP/AVP/TCP;unicast;interl
 for l in head.split("\r\n"):
     if l.lower().startswith("session"):
         sess = l.split(":")[1].split(";")[0].strip()
-        timeout_decl = "timeout=" in l
 emit(sess is not None, "RFC2326 SETUP returns Session", head.split("\r\n")[0])
 if not sess:
     sys.exit(0)
@@ -168,8 +183,74 @@ if srs[1]:
 else:
     emit(False, "RFC3550 video Sender Reports present", f"none within {sr_window:.0f}s")
 
-# -- keepalive + teardown --
+# -- keepalive --
 head, _, _ = req("GET_PARAMETER", url, f"Session: {sess}\r\n")
 emit("200" in head.split("\r\n")[0], "RFC2326 GET_PARAMETER keepalive answered", head.split("\r\n")[0])
+
+
+def frame_rate(window):
+    """Count interleaved data frames arriving within `window` seconds."""
+    global s
+    count = 0
+    buf = b""
+    end = time.time() + window
+    s.settimeout(0.5)
+    while time.time() < end:
+        try:
+            buf += s.recv(65536)
+        except socket.timeout:
+            continue
+        while len(buf) >= 4:
+            if buf[0:1] != b"$":
+                buf = buf[1:]
+                continue
+            ln = struct.unpack(">H", buf[2:4])[0]
+            if len(buf) < 4 + ln:
+                break
+            buf = buf[4 + ln:]
+            count += 1
+    return count
+
+
+# -- PAUSE stops delivery, PLAY resumes (RFC 2326 10.6) --
+pre = frame_rate(1.5)
+head, _, _ = req("PAUSE", url, f"Session: {sess}\r\n")
+if "200" in head.split("\r\n")[0]:
+    time.sleep(0.5)
+    frame_rate(0.5)  # drain in-flight
+    paused = frame_rate(1.5)
+    head, _, _ = req("PLAY", url, f"Session: {sess}\r\n")
+    resumed = frame_rate(2.0)
+    emit(pre > 10 and paused < max(3, pre // 10), "RFC2326 PAUSE halts delivery",
+         f"pre={pre} paused={paused}")
+    emit(resumed > 10, "RFC2326 PLAY resumes after PAUSE", f"resumed={resumed} frames/2s")
+else:
+    emit(False, "RFC2326 PAUSE supported", head.split("\r\n")[0])
+
 head, _, _ = req("TEARDOWN", url, f"Session: {sess}\r\n")
 emit("200" in head.split("\r\n")[0], "RFC2326 TEARDOWN 200", head.split("\r\n")[0])
+s.close()
+
+# -- Robustness: malformed requests must get 4xx, never break the server --
+try:
+    s = socket.create_connection((host, port), timeout=6)
+    cseq = 0
+    head, _, _ = req("DESCRIBE", f"rtsp://{host}:{port}/no/such/path",
+                     "Accept: application/sdp\r\n")
+    code = head.split("\r\n")[0]
+    emit(any(c in code for c in ("404", "403", "454")), "robustness: bogus path rejected", code)
+    head, _, _ = req("SETUP", url + "/video", "Transport: GARBAGE/NONSENSE;foo=bar\r\n")
+    code = head.split("\r\n")[0]
+    emit(any(c in code for c in ("400", "461", "451")), "robustness: garbage transport rejected", code)
+    head, _, _ = req("PLAY", url, "Session: 424242424242\r\n")
+    code = head.split("\r\n")[0]
+    emit(any(c in code for c in ("454", "400", "455")), "robustness: bogus session rejected", code)
+    s.close()
+    s = socket.create_connection((host, port), timeout=6)
+    cseq = 0
+    head, _, _ = req("DESCRIBE", url, "Accept: application/sdp\r\n")
+    emit("200" in head.split("\r\n")[0], "robustness: server healthy after abuse",
+         head.split("\r\n")[0])
+    s.close()
+except OSError as e:
+    emit(False, "robustness battery", f"connection error: {e}")
