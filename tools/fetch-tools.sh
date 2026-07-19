@@ -21,4 +21,24 @@ D=$(tar tf /tmp/$ASSET | head -1 | cut -d/ -f1)
 cp "/tmp/$D/bin/ffmpeg" "/tmp/$D/bin/ffprobe" .
 rm -rf "/tmp/$D" "/tmp/$ASSET"
 ./ffmpeg -version | head -1
+
+# openRTSP — the live555 test client, a different RTSP stack than
+# libav (ffmpeg/mpv). Built from live555 source: LIVE555_SRC points at
+# a checkout (default: the raptor build's .deps/live), else downloaded.
+LIVE555_SRC=${LIVE555_SRC:-../../raptor/.deps/live}
+if [ ! -x openRTSP ]; then
+    SRC=$(mktemp -d)
+    if [ -d "$LIVE555_SRC/testProgs" ]; then
+        cp -r "$LIVE555_SRC" "$SRC/live"
+    else
+        echo "fetching live555 source ..."
+        curl -sL http://www.live555.com/liveMedia/public/live555-latest.tar.gz |
+            tar xz -C "$SRC"
+    fi
+    (cd "$SRC/live" && sed -i 's/-DBSD=1/-DBSD=1 -std=c++20/' config.linux-64bit &&
+        ./genMakefiles linux-64bit && make -j"$(nproc)") >/dev/null 2>&1
+    cp "$SRC/live/testProgs/openRTSP" . && echo "built openRTSP"
+    rm -rf "$SRC"
+fi
+./openRTSP 2>&1 | head -1 || true
 echo "installed into $(pwd)"

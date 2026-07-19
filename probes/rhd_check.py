@@ -83,7 +83,32 @@ def http_get(path, with_auth=True, read_secs=0):
         if ":" in line:
             k, v = line.split(":", 1)
             headers[k.strip().lower()] = v.strip()
+    # RHD streams /audio and /mjpeg with Transfer-Encoding: chunked;
+    # strip the hex size markers or the payload is corrupt for decode.
+    if "chunked" in headers.get("transfer-encoding", "").lower():
+        body = _dechunk(body)
     return status, headers, body
+
+
+def _dechunk(buf):
+    out = b""
+    while buf:
+        nl = buf.find(b"\r\n")
+        if nl < 0:
+            break
+        try:
+            size = int(buf[:nl].split(b";")[0], 16)
+        except ValueError:
+            break
+        if size == 0:
+            break
+        chunk = buf[nl + 2:nl + 2 + size]
+        if len(chunk) < size:  # truncated final chunk from a timed read
+            out += chunk
+            break
+        out += chunk
+        buf = buf[nl + 2 + size + 2:]
+    return out
 
 
 # -- /snap --
@@ -100,6 +125,29 @@ if jpeg_ok:
 if user:
     st_na, _, _ = http_get("/snap", with_auth=False)
     emit(st_na == 401, "RHD /snap refuses unauthenticated access", f"HTTP {st_na}")
+
+# -- /audio (ADTS AAC or Ogg/Opus stream) --
+st, hdrs, body = http_get("/audio", read_secs=4)
+ctype = hdrs.get("content-type", "")
+if st == 404:
+    print("SKIP RHD /audio (no audio ring on target)", flush=True)
+else:
+    audio_ok = st == 200 and ctype.startswith("audio/") and len(body) > 2000
+    # RHD serves ADTS for AAC, Ogg for Opus, WAV (RIFF) for PCM/G.711
+    if "aac" in ctype:
+        n = body.count(b"\xff\xf1") + body.count(b"\xff\xf9")
+        framing, detail = n >= 5, f"{n} ADTS syncwords"
+    elif "ogg" in ctype or "opus" in ctype:
+        framing, detail = body[:4] == b"OggS", "ogg framing"
+    elif "wav" in ctype or "wave" in ctype:
+        framing, detail = body[:4] == b"RIFF" and b"WAVE" in body[:16], "RIFF/WAVE"
+    else:
+        framing, detail = False, "unknown container"
+    emit(audio_ok and framing, "RHD /audio streams framed audio",
+         f"HTTP {st}, {len(body)} bytes, {ctype}, {detail}")
+    if audio_ok:
+        with open(os.path.join(out, "rhd_audio.bin"), "wb") as f:
+            f.write(body)
 
 # -- /mjpeg --
 st, hdrs, body = http_get("/mjpeg", read_secs=6)

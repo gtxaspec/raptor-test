@@ -42,6 +42,8 @@ RTSP_USER=""
 RTSP_PASS=""
 RHD_URL=""
 SRT_URL=""
+TLS_URL=""
+RTMP_PORT=""
 while [ $# -gt 0 ]; do
     case "$1" in
     --sub) SUB_URL=$2; shift 2 ;;
@@ -55,6 +57,8 @@ while [ $# -gt 0 ]; do
     --pass) RTSP_PASS=$2; shift 2 ;;
     --rhd) RHD_URL=$2; shift 2 ;;
     --srt) SRT_URL=$2; shift 2 ;;
+    --tls) TLS_URL=$2; shift 2 ;;
+    --rtmp) RTMP_PORT=$2; shift 2 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -664,6 +668,37 @@ else
     skip "mpv (not installed)"
 fi
 
+# ── 8c. openRTSP: the live555 client stack (VLC's RTSP lineage) ──
+# ffmpeg and mpv share libav's RTSP; live555 negotiates and consumes
+# sessions differently, so it exercises server paths they cannot.
+ORTSP="$DIR/tools/openRTSP"
+if [ -x "$ORTSP" ]; then
+    ODIR="$WORK/ortsp"
+    mkdir -p "$ODIR"
+    (cd "$ODIR" && timeout -k 5 25 "$ORTSP" -t -d 8 -V -F s "$URL") \
+        >"$WORK/ortsp.log" 2>&1
+    OVID=$(find "$ODIR" -name 'svideo-*' -size +50k | head -1)
+    OERR=$(grep -ciE "fail|error|unable" "$WORK/ortsp.log")
+    if [ -n "$OVID" ] && [ "$OERR" -eq 0 ]; then
+        # The dumped elementary stream must decode
+        OCODEC=h264
+        case "$OVID" in *H265*) OCODEC=hevc ;; esac
+        "$FFMPEG" -nostdin -v error -f "$OCODEC" -i "$OVID" -frames:v 30 -f null - \
+            >"$WORK/ortsp_decode.log" 2>&1
+        if [ "$(grep -ciE "$ERRPAT" "$WORK/ortsp_decode.log")" -eq 0 ]; then
+            ok "openRTSP (live555 client): session + dumped video decodes ($(basename "$OVID"))"
+        else
+            bad "openRTSP dumped video decode" "see $WORK/ortsp_decode.log"
+            show_errs "$WORK/ortsp_decode.log"
+        fi
+    else
+        bad "openRTSP (live555 client)" "video dump missing/small or $OERR error lines"
+        tail -3 "$WORK/ortsp.log" | sed 's/^/          /'
+    fi
+else
+    skip "openRTSP (tools/openRTSP not built)"
+fi
+
 # clip_verify <name> <file> — a recorded clip must have sane streams,
 # matching durations, and decode with zero errors.
 clip_verify() {
@@ -733,6 +768,18 @@ if [ -n "$RHD_URL" ]; then
         else
             bad "RHD MJPEG decode" "see $WORK/mjpeg_decode.log"
             show_errs "$WORK/mjpeg_decode.log"
+        fi
+    fi
+    # The HTTP audio stream (ADTS/Ogg) must decode to real PCM
+    if [ -s "$WORK/rhd_audio.bin" ]; then
+        RHDA=$("$FFMPEG" -nostdin -v error -i "$WORK/rhd_audio.bin" -f s16le - \
+            2>"$WORK/rhd_audio_decode.log" | wc -c)
+        if [ "${RHDA:-0}" -gt 10000 ] && \
+           [ "$(grep -ciE "$ERRPAT|exceeds" "$WORK/rhd_audio_decode.log")" -eq 0 ]; then
+            ok "RHD /audio decodes to PCM ($RHDA bytes)"
+        else
+            bad "RHD /audio decode" "${RHDA:-0} PCM bytes, see $WORK/rhd_audio_decode.log"
+            show_errs "$WORK/rhd_audio_decode.log"
         fi
     fi
 fi
@@ -822,6 +869,82 @@ if [ -n "$SRT_URL" ]; then
             show_errs "$WORK/srt_a.log"
         fi
         rm -f "$WORK/srt_a.raw"
+    fi
+fi
+
+# ── 9d. RTSPS/TLS (--tls rtsps://host:port/path) ──
+if [ -n "$TLS_URL" ]; then
+    THP=${TLS_URL#rtsps://}
+    THP=${THP%%/*}
+    THOST=${THP%%:*}
+    TPORT=${THP##*:}
+    [ "$TPORT" = "$THOST" ] && TPORT=322
+    TPATH=/${TLS_URL#rtsps://*/}
+    TLSRPT=$(python3 - "$PROBES" "$THOST" "$TPORT" "$TPATH" "${RTSP_USER:-}" "${RTSP_PASS:-}" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+from rtsplib import RtspSession
+user = sys.argv[5] or None
+try:
+    s = RtspSession(sys.argv[2], sys.argv[3], sys.argv[4], user=user,
+                    password=sys.argv[6], tls=True)
+except Exception as e:
+    print(f"FAIL TLS handshake -- {e}")
+    sys.exit(0)
+proto = s.sock.version() or "unknown"
+st, sdp = s.describe()
+ok = "200" in st and "m=video" in sdp
+print(("OK " if ok else "FAIL ") + f"TLS: DESCRIBE over rtsps ({proto}) -- {st}")
+s.close()
+EOF
+)
+    while IFS= read -r line; do
+        case $line in
+            OK\ *)   ok "${line#OK }" ;;
+            FAIL\ *) bad "${line#FAIL }" ;;
+        esac
+    done <<< "$TLSRPT"
+    # ffmpeg over rtsps: real media through the TLS transport
+    TCRED=""
+    [ -n "$RTSP_USER" ] && TCRED="$RTSP_USER:$RTSP_PASS@"
+    if capture tls_media "$DUR" "rtsps://${TCRED}${THOST}:${TPORT}${TPATH}" tcp; then
+        ok "TLS: clean media over rtsps (${DUR}s)"
+    else
+        bad "TLS media" "see $WORK/tls_media.log"
+        show_errs "$WORK/tls_media.log"
+    fi
+fi
+
+# ── 9e. RTMP push (--rtmp <listen-port>): rsp pushes to this host ──
+# The device's rsp must be configured with [push] url pointing at this
+# host: rtmp://<this-host>:<port>/live/raptortest (rsp reconnects every
+# ~5s, so a fresh listener gets a connection within one cycle).
+if [ -n "$RTMP_PORT" ]; then
+    RTMP_REC="$WORK/rtmp_push.flv"
+    timeout -k 5 40 "$FFMPEG" -nostdin -v warning -listen 1 -timeout 25 \
+        -i "rtmp://0.0.0.0:$RTMP_PORT/live/raptortest" \
+        -t 10 -c copy -y "$RTMP_REC" >"$WORK/rtmp_listen.log" 2>&1
+    if [ -s "$RTMP_REC" ]; then
+        RTMP_INFO=$("$FFPROBE" -v error -show_entries stream=codec_type,codec_name \
+            -of csv=p=0 "$RTMP_REC" 2>/dev/null | sort -u | tr '\n' ' ')
+        if echo "$RTMP_INFO" | grep -q video; then
+            ok "RTMP push received from rsp ($RTMP_INFO)"
+        else
+            bad "RTMP push stream content" "no video: ${RTMP_INFO:-empty}"
+        fi
+        "$FFMPEG" -nostdin -v error -i "$RTMP_REC" -f null - \
+            >"$WORK/rtmp_decode.log" 2>&1
+        RDN=$(grep -cviE 'non monotonically increasing dts to muxer|Last message repeated' \
+            "$WORK/rtmp_decode.log")
+        if [ "${RDN:-1}" -eq 0 ]; then
+            ok "RTMP pushed stream decodes clean"
+        else
+            bad "RTMP pushed stream decode" "see $WORK/rtmp_decode.log"
+            show_errs "$WORK/rtmp_decode.log"
+        fi
+    else
+        bad "RTMP push" "nothing received on :$RTMP_PORT in 25s (is [push] url set to this host?)"
+        tail -2 "$WORK/rtmp_listen.log" | sed 's/^/          /'
     fi
 fi
 

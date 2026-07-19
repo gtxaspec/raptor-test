@@ -87,10 +87,15 @@ fails (`--keep-logs` keeps them always).
 | Deployed cameras | Established sessions are baselined before any suite traffic: clean refusals at `max_clients` with external viewers (an attached NVR) become capacity skips, the leak check compares against the baseline instead of zero, and single-digit UDP loss reports as wireless-grade rather than failing the regression guards |
 | Regression | Repeated default-transport ffprobe sessions (UDP dual-SETUP) followed by clean UDP media — guards the re-SETUP fd-leak and cross-wiring bug classes |
 | Players | mpv over TCP and UDP: error-free logs and A-V sync < 0.1s |
+| live555 client | openRTSP (VLC's RTSP lineage, a different stack than libav) negotiates a session and its dumped elementary stream decodes clean — exercises server paths ffmpeg/mpv cannot |
+| RTSPS/TLS | (`--tls rtsps://host:port/path`) TLS handshake, DESCRIBE 200 over rtsps, and clean media through the encrypted transport |
+| RTMP push | (`--rtmp <listen-port>`) rsp pushes to a listener on this host; the received FLV carries video and decodes clean (catches HE-AAC ASC mislabels on the push path) |
 | go2rtc | Clean media through a restream; AAC `config=` passed through verbatim |
 | Frigate | Dockerized Frigate records via TCP and UDP inputs; recorded clips verified |
 | RHD HTTP | (`--rhd`) `/snap` returns a decodable JPEG of sane size (and refuses unauthenticated access when credentials are set); `/mjpeg` is `multipart/x-mixed-replace` carrying multiple JPEG parts that decode frame-by-frame with no errors |
+| RHD /audio | (`--rhd`) the HTTP audio stream (ADTS AAC, Ogg/Opus, or WAV/PCM, de-chunked) is framed correctly and decodes to PCM |
 | SRT | (`--srt`) connects as a caller to the SRT listener (rsr), confirms the MPEG-TS carries video, decodes the video clean, and decodes the audio all the way to PCM — the last step catches an ADTS sample-rate mislabel that a container probe would miss |
+| Codec matrix | `tools/codec-matrix.sh` sweeps l16/pcmu/pcma/opus/aac against **both** RTSP backends per codec, asserting the audio RTP timestamp step equals the codec's real frame duration (a server timestamping AAC at its 20ms chunk rate decodes fine but runs the clock 3x fast) |
 | Clips | Recorded files: streams present, durations aligned, full decode with zero errors (null-muxer dts nag and its repeat-tails excluded; file-level dts asserted to never move backward instead) |
 | Device | (`--ssh`) rsd CPU sane after the suite, connection count back at the pre-suite baseline |
 
@@ -133,7 +138,7 @@ with exact wire cadence (G.711 modal 160, opus modal 960 at 100%).
 
 ## Not covered (yet)
 
-RTSPS/TLS, RTP-level MJPEG (RFC 2435), WHIP/WebRTC legs,
-backchannel audio, and multi-hour soak runs (a `--soak` mode with
-RSS/FD trending is the natural shape). The raptor provenance suite
+RTP-level MJPEG (rsd's `/jpeg`), WHIP/WebRTC (rwd), backchannel
+audio, and multi-hour soak runs (a `--soak` mode with RSS/FD trending
+is the natural shape). The raptor provenance suite
 separately covers snapshots, EXIF, signing, and rverify chains.

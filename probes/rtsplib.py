@@ -7,17 +7,26 @@ interleaved RTP/RTCP frames with a deadline.
 """
 import hashlib
 import socket
+import ssl
 import struct
 import time
 
 
 class RtspSession:
-    def __init__(self, host, port, path, timeout=6.0, user=None, password=None):
+    def __init__(self, host, port, path, timeout=6.0, user=None, password=None, tls=False):
         self.host = host
         self.port = int(port)
         self.path = path
-        self.url = f"rtsp://{host}:{port}{path}"
+        scheme = "rtsps" if tls else "rtsp"
+        self.url = f"{scheme}://{host}:{port}{path}"
         self.sock = socket.create_connection((host, self.port), timeout=timeout)
+        if tls:
+            # Cameras ship self-signed certs; the probe verifies the
+            # protocol, not the CA chain.
+            cx = ssl.create_default_context()
+            cx.check_hostname = False
+            cx.verify_mode = ssl.CERT_NONE
+            self.sock = cx.wrap_socket(self.sock, server_hostname=host)
         self.cseq = 0
         self.session_id = None
         self.leftover = b""
