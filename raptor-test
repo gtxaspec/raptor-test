@@ -29,7 +29,7 @@
 # kill only a timeout wrapper (orphaned ffmpeg streams forever).
 set -u
 
-URL=${1:?usage: raptor-test <rtsp-url> [--sub url] [--ssh user@host] [--duration s] [--keep-logs]}
+URL=${1:?usage: raptor-test <rtsp-url> [--sub url] [--ssh user@host] [--user u --pass p] [--duration s] [--keep-logs]}
 shift
 SUB_URL=""
 SSH_TARGET=""
@@ -38,6 +38,8 @@ KEEP=0
 GO2RTC=""
 FRIGATE=0
 RECDIR=""
+RTSP_USER=""
+RTSP_PASS=""
 while [ $# -gt 0 ]; do
     case "$1" in
     --sub) SUB_URL=$2; shift 2 ;;
@@ -47,6 +49,8 @@ while [ $# -gt 0 ]; do
     --frigate) FRIGATE=1; shift ;;
     --record-check) RECDIR=$2; shift 2 ;;
     --keep-logs) KEEP=1; shift ;;
+    --user) RTSP_USER=$2; shift 2 ;;
+    --pass) RTSP_PASS=$2; shift 2 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -54,10 +58,26 @@ done
 
 HOSTPORT=${URL#rtsp://}
 HOSTPORT=${HOSTPORT%%/*}
+case "$HOSTPORT" in
+*@*)
+    USERINFO=${HOSTPORT%%@*}
+    RTSP_USER=${RTSP_USER:-${USERINFO%%:*}}
+    RTSP_PASS=${RTSP_PASS:-${USERINFO#*:}}
+    HOSTPORT=${HOSTPORT##*@}
+    ;;
+esac
 HOST=${HOSTPORT%%:*}
 PORT=${HOSTPORT##*:}
 [ "$PORT" = "$HOST" ] && PORT=554
 RPATH=/${URL#rtsp://*/}
+
+# With --user/--pass, client legs (ffmpeg/mpv/go2rtc/frigate) get the
+# credentials in the URL; raw probes take them as arguments and speak
+# digest themselves. HOST/PORT/RPATH always stay credential-free.
+if [ -n "$RTSP_USER" ]; then
+    case "$URL" in *@*) : ;; *) URL="rtsp://$RTSP_USER:$RTSP_PASS@${URL#rtsp://}" ;; esac
+    case "$SUB_URL" in *@*) : ;; *) SUB_URL="rtsp://$RTSP_USER:$RTSP_PASS@${SUB_URL#rtsp://}" ;; esac
+fi
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 PROBES="$DIR/probes"
@@ -156,32 +176,62 @@ echo "    client: $("$FFMPEG" -version 2>/dev/null | head -1 | grep -oE 'version
 echo "    logs: $WORK"
 
 # ── 1. Signaling (DESCRIBE) ──
-SDP=$(python3 - "$HOST" "$PORT" "$RPATH" <<'EOF'
-import socket, sys
-host, port, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-s = socket.create_connection((host, port), timeout=5)
-s.sendall(f"DESCRIBE rtsp://{host}:{port}{path} RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n\r\n".encode())
-buf = b""
-while len(buf) < 16384:
-    try:
-        d = s.recv(4096)
-    except socket.timeout:
-        break
-    if not d:
-        break
-    buf += d
-    if b"\r\n\r\n" in buf and b"Content-Length" in buf:
-        head, body = buf.split(b"\r\n\r\n", 1)
-        for line in head.split(b"\r\n"):
-            if line.lower().startswith(b"content-length"):
-                if len(body) >= int(line.split(b":")[1]):
-                    print(buf.decode(errors="replace"))
-                    sys.exit(0)
-print(buf.decode(errors="replace"))
+SDP=$(python3 - "$PROBES" "$HOST" "$PORT" "$RPATH" "${RTSP_USER:-}" "${RTSP_PASS:-}" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+from rtsplib import RtspSession
+user = sys.argv[5] or None
+s = RtspSession(sys.argv[2], sys.argv[3], sys.argv[4], user=user, password=sys.argv[6])
+status, sdp = s.describe()
+s.close()
+print(status)
+print(sdp)
 EOF
 )
 echo "$SDP" >"$WORK/sdp.txt"
 if echo "$SDP" | grep -q 'm=video'; then ok "SDP: video track present"; else bad "SDP: video track present"; fi
+
+# ── 1b. Auth battery (--user/--pass): the machinery must challenge,
+# reject, accept, and enforce ──
+if [ -n "$RTSP_USER" ]; then
+    AUTHRPT=$(python3 - "$PROBES" "$HOST" "$PORT" "$RPATH" "$RTSP_USER" "$RTSP_PASS" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+from rtsplib import RtspSession
+host, port, path, user, pw = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
+
+def emit(ok, name, detail=""):
+    print(("OK " if ok else "FAIL ") + name + (" -- " + detail if detail else ""))
+
+s = RtspSession(host, port, path)  # no creds
+st, _ = s.describe()
+ch = s.last_challenge or {}
+emit("401" in st and "realm" in ch and "nonce" in ch,
+     "auth: unauthenticated DESCRIBE gets Digest challenge", st)
+st2, _, _ = s.request("SETUP", s.url + "/video",
+                      extra="Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n")
+emit("401" in st2, "auth: unauthenticated SETUP refused", st2)
+s.close()
+
+s = RtspSession(host, port, path, user=user, password="definitely-wrong")
+st, _ = s.describe()
+emit("401" in st, "auth: wrong password rejected", st)
+s.close()
+
+s = RtspSession(host, port, path, user=user, password=pw)
+st, _ = s.describe()
+emit("200" in st, "auth: correct digest accepted", st)
+s.close()
+EOF
+)
+    echo "$AUTHRPT" >"$WORK/auth.txt"
+    while IFS= read -r line; do
+        case $line in
+            OK\ *)   ok "${line#OK }" ;;
+            FAIL\ *) bad "${line#FAIL }" ;;
+        esac
+    done <<< "$AUTHRPT"
+fi
 
 CONFIG=$(echo "$SDP" | grep -o 'config=[0-9A-Fa-f]*' | head -1 | cut -d= -f2)
 ACLK=$(echo "$SDP" | grep -oiE 'mpeg4-generic/[0-9]+' | head -1 | cut -d/ -f2)
@@ -214,7 +264,7 @@ if [ "$SUB_URL" != "$URL" ]; then
 fi
 
 # ── 3. Wire-level RTP continuity (raw TCP-interleaved probe) ──
-python3 "$PROBES/seq_gap.py" "$HOST" "$PORT" "$RPATH" 15 >"$WORK/seqgap.txt" 2>&1
+python3 "$PROBES/seq_gap.py" "$HOST" "$PORT" "$RPATH" 15 ${RTSP_USER:+"$RTSP_USER" "$RTSP_PASS"} >"$WORK/seqgap.txt" 2>&1
 GAPRPT=$(head -1 "$WORK/seqgap.txt")
 TSRPT=$(sed -n 2p "$WORK/seqgap.txt")
 if echo "$GAPRPT" | grep -qE 'seq-lost=0.*seq-lost=0'; then
@@ -255,6 +305,37 @@ if [ -n "$TSRPT" ]; then
         fi
     fi
 fi
+# UDP consumers need MTU-sized packets: bigger ones IP-fragment, so
+# one lost fragment loses the whole packet (interleaved sizes mirror
+# the same packetizer)
+MAXRTP=$(echo "$GAPRPT" | grep -oE 'max-rtp=[0-9]+' | grep -oE '[0-9]+')
+if [ -n "$MAXRTP" ]; then
+    if [ "$MAXRTP" -le 1472 ]; then
+        ok "RTP packets MTU-safe (max $MAXRTP bytes)"
+    else
+        bad "RTP packets exceed Ethernet MTU (IP-fragment on UDP)" "max $MAXRTP bytes"
+    fi
+fi
+
+# ── 3b. Session lifecycle: silent-client reaping, transport re-SETUP ──
+SESSRPT=$(timeout 40 python3 "$PROBES/session_probe.py" switch "$HOST" "$PORT" "$RPATH" ${RTSP_USER:+"$RTSP_USER" "$RTSP_PASS"} 2>&1)
+echo "$SESSRPT" >"$WORK/switch.txt"
+while IFS= read -r line; do
+    case $line in
+        OK\ *)   ok "${line#OK }" ;;
+        FAIL\ *) bad "${line#FAIL }" ;;
+        SKIP\ *) skip "${line#SKIP }" ;;
+    esac
+done <<< "$SESSRPT"
+REAPRPT=$(timeout 110 python3 "$PROBES/session_probe.py" reap "$HOST" "$PORT" "$RPATH" ${RTSP_USER:+"$RTSP_USER" "$RTSP_PASS"} 2>&1)
+echo "$REAPRPT" >"$WORK/reap.txt"
+while IFS= read -r line; do
+    case $line in
+        OK\ *)   ok "${line#OK }" ;;
+        FAIL\ *) bad "${line#FAIL }" ;;
+        SKIP\ *) skip "${line#SKIP }" ;;
+    esac
+done <<< "$REAPRPT"
 
 # ── 4. A/V timestamps in a real capture ──
 # -copyinkf: ffmpeg's streamcopy waits for a key-flagged packet per
@@ -387,7 +468,7 @@ if [ -n "$RAWFMT" ]; then
 fi
 
 # ── 4d. RFC conformance (RFC 2326 / 4566 / 3550 / 3640) ──
-python3 "$PROBES/rfc_check.py" "$HOST" "$PORT" "$RPATH" 8 >"$WORK/rfc.txt" 2>&1
+python3 "$PROBES/rfc_check.py" "$HOST" "$PORT" "$RPATH" 8 ${RTSP_USER:+"$RTSP_USER" "$RTSP_PASS"} >"$WORK/rfc.txt" 2>&1
 while IFS= read -r line; do
     case "$line" in
     OK\ *) ok "${line#OK }" ;;
@@ -528,6 +609,22 @@ if [ -n "$SSH_TARGET" ]; then
         ok "no leaked TCP connections (baseline $EXTERNAL_SESSIONS external, now ${NCONN:-0})"
     else
         bad "leaked TCP connections" "baseline ${EXTERNAL_SESSIONS:-0}, now ${NCONN:-?}"
+    fi
+    # IPv6 leg: dual-stack listeners have had v4/v6 path differences;
+    # production NVRs commonly attach over v6.
+    V6=$(ssh -o ConnectTimeout=8 "$SSH_TARGET" \
+        "ip -6 addr show scope global 2>/dev/null | grep -oE 'inet6 [0-9a-f:]+' | head -1 | cut -d' ' -f2" 2>/dev/null)
+    if [ -n "$V6" ]; then
+        V6CRED=""
+        [ -n "$RTSP_USER" ] && V6CRED="$RTSP_USER:$RTSP_PASS@"
+        if capture ipv6_tcp "$DUR" "rtsp://${V6CRED}[$V6]:$PORT$RPATH" tcp; then
+            ok "IPv6: clean media over TCP ([$V6])"
+        else
+            bad "IPv6 media" "see $WORK/ipv6_tcp.log"
+            show_errs "$WORK/ipv6_tcp.log"
+        fi
+    else
+        skip "IPv6 leg (no global v6 address on target)"
     fi
 else
     skip "device health (--ssh not given)"

@@ -5,13 +5,14 @@ connection, which interleaving makes deterministic. Not a general
 client; just enough protocol to DESCRIBE/SETUP/PLAY and iterate
 interleaved RTP/RTCP frames with a deadline.
 """
+import hashlib
 import socket
 import struct
 import time
 
 
 class RtspSession:
-    def __init__(self, host, port, path, timeout=6.0):
+    def __init__(self, host, port, path, timeout=6.0, user=None, password=None):
         self.host = host
         self.port = int(port)
         self.path = path
@@ -20,14 +21,30 @@ class RtspSession:
         self.cseq = 0
         self.session_id = None
         self.leftover = b""
+        self.user = user
+        self.password = password
+        self.last_challenge = None
 
-    def request(self, method, url=None, extra="", body_expected=True):
-        """Send one request, return (status_line, headers_dict, body)."""
+    def _digest_auth(self, method, uri):
+        """Authorization header from the stored Digest challenge."""
+        ch = self.last_challenge or {}
+        realm, nonce = ch.get("realm", ""), ch.get("nonce", "")
+        ha1 = hashlib.md5(f"{self.user}:{realm}:{self.password}".encode()).hexdigest()
+        ha2 = hashlib.md5(f"{method}:{uri}".encode()).hexdigest()
+        resp = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
+        return (f'Authorization: Digest username="{self.user}", realm="{realm}", '
+                f'nonce="{nonce}", uri="{uri}", response="{resp}"\r\n')
+
+    def request(self, method, url=None, extra="", body_expected=True, _retried=False):
+        """Send one request, return (status_line, headers_dict, body).
+        With credentials set, a 401 Digest challenge is answered once."""
         self.cseq += 1
         u = url or self.url
         msg = f"{method} {u} RTSP/1.0\r\nCSeq: {self.cseq}\r\nUser-Agent: raptor-test\r\n"
         if self.session_id and "Session:" not in extra:
             msg += f"Session: {self.session_id}\r\n"
+        if self.user and self.last_challenge:
+            msg += self._digest_auth(method, u)
         msg += extra + "\r\n"
         self.sock.sendall(msg.encode())
         buf = self.leftover
@@ -62,6 +79,15 @@ class RtspSession:
         self.leftover = rest[clen:]
         if "session" in headers and not self.session_id:
             self.session_id = headers["session"].split(";")[0].strip()
+        if "401" in lines[0] and "www-authenticate" in headers:
+            www = headers["www-authenticate"]
+            if www.lower().startswith("digest"):
+                self.last_challenge = dict(
+                    (k.strip(), v.strip().strip('"'))
+                    for k, v in (kv.split("=", 1)
+                                 for kv in www[6:].split(",") if "=" in kv))
+                if self.user and not _retried:
+                    return self.request(method, url, extra, body_expected, _retried=True)
         return lines[0], headers, rest[:clen].decode(errors="replace")
 
     def describe(self):

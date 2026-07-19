@@ -15,7 +15,9 @@ from collections import Counter
 from rtsplib import RtspSession, parse_rtp
 
 host, port, path, dur = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
-s = RtspSession(host, port, path)
+auth_user = sys.argv[5] if len(sys.argv) > 5 else None
+auth_pass = sys.argv[6] if len(sys.argv) > 6 else None
+s = RtspSession(host, port, path, user=auth_user, password=auth_pass)
 _, sdp = s.describe()
 clocks = {0: 90000, 2: 0}
 for line in sdp.splitlines():
@@ -35,6 +37,7 @@ s.play()
 last = {}
 count = {0: 0, 2: 0}
 gaps = {0: 0, 2: 0}
+maxlen = 0
 last_ts = {}
 last_wall = {}
 deltas = {0: [], 2: []}
@@ -47,6 +50,8 @@ for t, ch, pkt in s.packets(dur):
     rtp = parse_rtp(pkt)
     if not rtp:
         continue
+    if len(pkt) > maxlen:
+        maxlen = len(pkt)
     seq, ts, _m = rtp
     if ch in last:
         d = (seq - last[ch]) & 0xFFFF
@@ -65,7 +70,7 @@ for t, ch, pkt in s.packets(dur):
     last_wall[ch] = t
 s.close()
 print(f"wall {elapsed:.1f}s: video pkts={count[0]} seq-lost={gaps[0]} | "
-      f"audio pkts={count[2]} seq-lost={gaps[2]}")
+      f"audio pkts={count[2]} seq-lost={gaps[2]} | max-rtp={maxlen}")
 
 
 def ts_summary(name, dl, clock, jl):

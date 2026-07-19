@@ -19,7 +19,8 @@ test once missed the bug it now catches.
     --ssh root@CAM \                     # device health checks (raptor bench)
     --go2rtc http://GO2RTC-HOST:1984 \   # restream leg
     --frigate \                          # dockerized Frigate record + clip verify
-    --record-check /path/to/recordings   # verify an external recorder's newest clip
+    --record-check /path/to/recordings \ # verify an external recorder's newest clip
+    --user admin --pass secret           # digest credentials (deployed cameras)
 ```
 
 Requires `ffmpeg`/`ffprobe` and `python3`; uses `mpv` and `docker`
@@ -42,6 +43,10 @@ fails (`--keep-logs` keeps them always).
 | Timestamps | Real capture: per-track monotonicity in native timebases, A/V end alignment; audio cadence vs nominal rate in ppm (catches source-clock drift) |
 | Content | Measured video fps vs nominal (within 15%), resolution sanity, decoded audio sample count vs declared rate (catches SBR/rate mislabels), GOP cadence from a raw bitstream census, per-frame SEI presence (raptor ST 0604; skipped when absent) |
 | RTSP behavior | PAUSE halts delivery and PLAY resumes; malformed requests (bogus path, garbage transport, unknown session) answered with 4xx and the server stays healthy |
+| Sessions | A silently-vanished UDP client (no teardown, no keepalive, no RTCP) must stop receiving media within the advertised Session timeout and be reaped server-side; mid-session TCP-to-UDP re-SETUP either moves the media or is refused 455 with the session intact |
+| Auth | (`--user/--pass`) unauthenticated DESCRIBE draws a Digest challenge, unauthenticated SETUP is refused, wrong password rejected, correct digest accepted; the whole suite then runs authenticated (probes speak digest, client legs carry URL credentials) |
+| MTU | Max RTP packet size at most 1472 bytes: anything larger IP-fragments on UDP paths, so one lost fragment costs the whole packet |
+| IPv6 | (`--ssh`) clean media over the target's global IPv6 address, the family production NVRs commonly attach over |
 | Fault injection | Abruptly killed client (RST mid-stream) followed by clean media for the next client |
 | RFC 2326 | OPTIONS Public methods, DESCRIBE/SETUP/PLAY/TEARDOWN status codes, Session header, GET_PARAMETER keepalive, RTP-Info anchors matching the first actual packets |
 | RFC 4566 | `o=` origin sanity, media sections, `a=control`, sprop parameter sets for H.26x |
@@ -96,7 +101,7 @@ with exact wire cadence (G.711 modal 160, opus modal 960 at 100%).
 
 ## Not covered (yet)
 
-Session-timeout reaping (needs a 60s idle wait), RTSPS/TLS and
-authenticated sessions, backchannel audio, and multi-hour soak runs.
-Candidates for a `--soak` mode. The raptor provenance suite separately
-covers snapshots, EXIF, signing, and rverify chains.
+RTSPS/TLS, MJPEG (RFC 2435) endpoints, SRT and WHIP/WebRTC legs,
+backchannel audio, and multi-hour soak runs (a `--soak` mode with
+RSS/FD trending is the natural shape). The raptor provenance suite
+separately covers snapshots, EXIF, signing, and rverify chains.

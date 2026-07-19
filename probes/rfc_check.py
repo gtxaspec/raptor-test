@@ -7,6 +7,7 @@ Emits one line per check: "OK <name> -- <detail>" or "FAIL <name> -- <detail>".
 Exit code 0 even on FAILs (the caller tallies); nonzero only on transport
 errors that prevent the probe from running.
 """
+import hashlib
 import socket
 import struct
 import sys
@@ -14,8 +15,11 @@ import time
 
 host, port, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 sr_window = float(sys.argv[4]) if len(sys.argv) > 4 else 8.0
+auth_user = sys.argv[5] if len(sys.argv) > 5 else None
+auth_pass = sys.argv[6] if len(sys.argv) > 6 else None
 url = f"rtsp://{host}:{port}{path}"
 results = []
+challenge = {}
 
 
 def emit(okay, name, detail=""):
@@ -44,10 +48,21 @@ def _skip_frames(buf):
     return buf
 
 
-def req(method, u, extra=""):
+def _digest(method, u):
+    realm = challenge.get("realm", "")
+    nonce = challenge.get("nonce", "")
+    ha1 = hashlib.md5(f"{auth_user}:{realm}:{auth_pass}".encode()).hexdigest()
+    ha2 = hashlib.md5(f"{method}:{u}".encode()).hexdigest()
+    resp = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
+    return (f'Authorization: Digest username="{auth_user}", realm="{realm}", '
+            f'nonce="{nonce}", uri="{u}", response="{resp}"\r\n')
+
+
+def req(method, u, extra="", _retried=False):
     global cseq
     cseq += 1
-    s.sendall(f"{method} {u} RTSP/1.0\r\nCSeq: {cseq}\r\nUser-Agent: raptor-test\r\n{extra}\r\n".encode())
+    auth_hdr = _digest(method, u) if auth_user and challenge else ""
+    s.sendall(f"{method} {u} RTSP/1.0\r\nCSeq: {cseq}\r\nUser-Agent: raptor-test\r\n{auth_hdr}{extra}\r\n".encode())
     buf = b""
     while True:
         buf = _skip_frames(buf)
@@ -64,7 +79,16 @@ def req(method, u, extra=""):
             clen = int(line.split(b":")[1])
     while len(rest) < clen:
         rest += s.recv(4096)
-    return head.decode(errors="replace"), rest[:clen].decode(errors="replace"), rest[clen:]
+    hd = head.decode(errors="replace")
+    if auth_user and " 401 " in hd.split("\r\n")[0] + " " and not _retried:
+        for line in hd.split("\r\n"):
+            if line.lower().startswith("www-authenticate") and "digest" in line.lower():
+                www = line.split(":", 1)[1].strip()
+                challenge.update((k.strip(), v.strip().strip('"'))
+                                 for k, v in (kv.split("=", 1)
+                                              for kv in www[6:].split(",") if "=" in kv))
+                return req(method, u, extra, _retried=True)
+    return hd, rest[:clen].decode(errors="replace"), rest[clen:]
 
 
 # -- RFC 2326: OPTIONS --
