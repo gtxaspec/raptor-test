@@ -20,7 +20,8 @@ test once missed the bug it now catches.
     --go2rtc http://GO2RTC-HOST:1984 \   # restream leg
     --frigate \                          # dockerized Frigate record + clip verify
     --record-check /path/to/recordings \ # verify an external recorder's newest clip
-    --user admin --pass secret           # digest credentials (deployed cameras)
+    --user admin --pass secret \        # digest credentials (deployed cameras)
+    --rhd https://CAM:8443               # RHD HTTP: JPEG snapshot + MJPEG stream
 ```
 
 Requires `ffmpeg`/`ffprobe` and `python3`; uses `mpv` and `docker`
@@ -59,6 +60,7 @@ fails (`--keep-logs` keeps them always).
 | Players | mpv over TCP and UDP: error-free logs and A-V sync < 0.1s |
 | go2rtc | Clean media through a restream; AAC `config=` passed through verbatim |
 | Frigate | Dockerized Frigate records via TCP and UDP inputs; recorded clips verified |
+| RHD HTTP | (`--rhd`) `/snap` returns a decodable JPEG of sane size (and refuses unauthenticated access when credentials are set); `/mjpeg` is `multipart/x-mixed-replace` carrying multiple JPEG parts that decode frame-by-frame with no errors |
 | Clips | Recorded files: streams present, durations aligned, full decode with zero errors (null-muxer dts nag and its repeat-tails excluded; file-level dts asserted to never move backward instead) |
 | Device | (`--ssh`) rsd CPU sane after the suite, connection count back at the pre-suite baseline |
 
@@ -101,7 +103,7 @@ with exact wire cadence (G.711 modal 160, opus modal 960 at 100%).
 
 ## Not covered (yet)
 
-RTSPS/TLS, MJPEG (RFC 2435) endpoints, SRT and WHIP/WebRTC legs,
+RTSPS/TLS, RTP-level MJPEG (RFC 2435), SRT and WHIP/WebRTC legs,
 backchannel audio, and multi-hour soak runs (a `--soak` mode with
 RSS/FD trending is the natural shape). The raptor provenance suite
 separately covers snapshots, EXIF, signing, and rverify chains.

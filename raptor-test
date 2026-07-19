@@ -40,6 +40,7 @@ FRIGATE=0
 RECDIR=""
 RTSP_USER=""
 RTSP_PASS=""
+RHD_URL=""
 while [ $# -gt 0 ]; do
     case "$1" in
     --sub) SUB_URL=$2; shift 2 ;;
@@ -51,6 +52,7 @@ while [ $# -gt 0 ]; do
     --keep-logs) KEEP=1; shift ;;
     --user) RTSP_USER=$2; shift 2 ;;
     --pass) RTSP_PASS=$2; shift 2 ;;
+    --rhd) RHD_URL=$2; shift 2 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -692,6 +694,41 @@ clip_verify() {
         ok "$name (v=${vdur}s a=${adur:-none}s, decode clean)"
     fi
 }
+
+# ── 8b. RHD HTTP endpoints: JPEG snapshot + MJPEG stream (--rhd) ──
+if [ -n "$RHD_URL" ]; then
+    RHD_OUT="$WORK" python3 "$PROBES/rhd_check.py" "$RHD_URL" \
+        ${RTSP_USER:+"$RTSP_USER" "$RTSP_PASS"} >"$WORK/rhd.txt" 2>&1
+    while IFS= read -r line; do
+        case $line in
+            OK\ *)   ok "${line#OK }" ;;
+            FAIL\ *) bad "${line#FAIL }" ;;
+        esac
+    done <"$WORK/rhd.txt"
+    # Decode what the probe captured: a snapshot must be a fully
+    # decodable frame of sane size, and the MJPEG sample must decode
+    # frame-by-frame with no errors.
+    if [ -s "$WORK/snap.jpg" ]; then
+        SNAPDIM=$("$FFPROBE" -v error -select_streams v -show_entries stream=width,height \
+            -of csv=p=0 "$WORK/snap.jpg" 2>/dev/null)
+        SW=${SNAPDIM%%,*}
+        if [ -n "$SW" ] && [ "$SW" -ge 160 ] 2>/dev/null; then
+            ok "RHD snapshot decodes ($SNAPDIM)"
+        else
+            bad "RHD snapshot decode" "ffprobe found no valid image (${SNAPDIM:-none})"
+        fi
+    fi
+    if [ -s "$WORK/mjpeg.bin" ]; then
+        "$FFMPEG" -nostdin -v error -f mjpeg -i "$WORK/mjpeg.bin" -frames:v 8 -f null - \
+            >"$WORK/mjpeg_decode.log" 2>&1
+        if [ "$(grep -ciE "$ERRPAT" "$WORK/mjpeg_decode.log")" -eq 0 ]; then
+            ok "RHD MJPEG frames decode clean"
+        else
+            bad "RHD MJPEG decode" "see $WORK/mjpeg_decode.log"
+            show_errs "$WORK/mjpeg_decode.log"
+        fi
+    fi
+fi
 
 # ── 9. go2rtc restream (--go2rtc) ──
 if [ -n "$GO2RTC" ]; then
