@@ -21,8 +21,17 @@ test once missed the bug it now catches.
     --frigate \                          # dockerized Frigate record + clip verify
     --record-check /path/to/recordings \ # verify an external recorder's newest clip
     --user admin --pass secret \        # digest credentials (deployed cameras)
-    --rhd https://CAM:8443               # RHD HTTP: JPEG snapshot + MJPEG stream
+    --rhd https://CAM:8443 \            # RHD HTTP: JPEG snapshot + MJPEG stream
+    --srt srt://CAM:9000                 # SRT (rsr): MPEG-TS video+audio decode
 ```
+
+Point the RTSP URL at any backend: raptor's compy server (`rsd`) or
+its live555 server (`rsd-555`) on its own port. The probes read each
+media's `a=control` from the SDP, so track naming differences between
+backends are handled transparently. One known live555 difference: it
+answers a malformed `Transport` header with 200 instead of 461, so the
+garbage-transport robustness check reports a failure against rsd-555 —
+that is upstream live555 leniency, not an rsd-555 defect.
 
 Requires `ffmpeg`/`ffprobe` and `python3`; uses `mpv` and `docker`
 when present. Run `tools/fetch-tools.sh` once to pin an official
@@ -61,6 +70,7 @@ fails (`--keep-logs` keeps them always).
 | go2rtc | Clean media through a restream; AAC `config=` passed through verbatim |
 | Frigate | Dockerized Frigate records via TCP and UDP inputs; recorded clips verified |
 | RHD HTTP | (`--rhd`) `/snap` returns a decodable JPEG of sane size (and refuses unauthenticated access when credentials are set); `/mjpeg` is `multipart/x-mixed-replace` carrying multiple JPEG parts that decode frame-by-frame with no errors |
+| SRT | (`--srt`) connects as a caller to the SRT listener (rsr), confirms the MPEG-TS carries video, decodes the video clean, and decodes the audio all the way to PCM — the last step catches an ADTS sample-rate mislabel that a container probe would miss |
 | Clips | Recorded files: streams present, durations aligned, full decode with zero errors (null-muxer dts nag and its repeat-tails excluded; file-level dts asserted to never move backward instead) |
 | Device | (`--ssh`) rsd CPU sane after the suite, connection count back at the pre-suite baseline |
 
@@ -103,7 +113,7 @@ with exact wire cadence (G.711 modal 160, opus modal 960 at 100%).
 
 ## Not covered (yet)
 
-RTSPS/TLS, RTP-level MJPEG (RFC 2435), SRT and WHIP/WebRTC legs,
+RTSPS/TLS, RTP-level MJPEG (RFC 2435), WHIP/WebRTC legs,
 backchannel audio, and multi-hour soak runs (a `--soak` mode with
 RSS/FD trending is the natural shape). The raptor provenance suite
 separately covers snapshots, EXIF, signing, and rverify chains.

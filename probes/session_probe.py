@@ -78,7 +78,7 @@ if mode == "reap":
     s = RtspSession(host, port, path, user=user, password=password)
     s.describe()
     rtp, rtcp, p0, p1 = udp_pair()
-    st, hdrs, _ = s.request("SETUP", s.url + "/video",
+    st, hdrs, _ = s.request("SETUP", s.track_url("video"),
                             extra=f"Transport: RTP/AVP;unicast;client_port={p0}-{p1}\r\n")
     if "200" not in st:
         emit(False, "reap: UDP SETUP", st)
@@ -125,7 +125,7 @@ elif mode == "switch":
             frames += 1
     emit(frames > 10, "switch: interleaved media before switch", f"{frames} pkts/3s")
     rtp, rtcp, p0, p1 = udp_pair()
-    st, _, _ = s.request("SETUP", s.url + "/video",
+    st, _, _ = s.request("SETUP", s.track_url("video"),
                          extra=f"Transport: RTP/AVP;unicast;client_port={p0}-{p1}\r\n")
     if "200" not in st:
         # Mid-session transport change may be refused (455): that is

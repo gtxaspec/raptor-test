@@ -35,16 +35,6 @@ except OSError as e:
 cseq = 0
 
 
-def _skip_frames(buf):
-    """Drop leading interleaved $-frames so RTSP headers parse clean."""
-    while len(buf) >= 4 and buf[0:1] == b"$":
-        ln = struct.unpack(">H", buf[2:4])[0]
-        if len(buf) < 4 + ln:
-            break
-        buf = buf[4 + ln:]
-    return buf
-
-
 def _digest(method, u):
     realm = challenge.get("realm", "")
     nonce = challenge.get("nonce", "")
@@ -60,16 +50,19 @@ def req(method, u, extra="", _retried=False):
     cseq += 1
     auth_hdr = _digest(method, u) if auth_user and challenge else ""
     s.sendall(f"{method} {u} RTSP/1.0\r\nCSeq: {cseq}\r\nUser-Agent: raptor-test\r\n{auth_hdr}{extra}\r\n".encode())
+    # Locate the RTSP response start rather than splitting on the first
+    # blank line: after PLAY the socket carries interleaved RTP that can
+    # begin mid-frame, so a naive split lands inside binary payload.
     buf = b""
     while True:
-        buf = _skip_frames(buf)
-        if b"\r\n\r\n" in buf and not buf.startswith(b"$"):
+        i = buf.find(b"RTSP/1.0 ")
+        if i >= 0 and b"\r\n\r\n" in buf[i:]:
             break
         d = s.recv(4096)
         if not d:
             return "", "", b""
         buf += d
-    head, rest = buf.split(b"\r\n\r\n", 1)
+    head, rest = buf[buf.find(b"RTSP/1.0 "):].split(b"\r\n\r\n", 1)
     clen = 0
     for line in head.split(b"\r\n"):
         if line.lower().startswith(b"content-length"):
@@ -143,9 +136,23 @@ if maudio:
             emit(int(apt) >= 96 if apt.isdigit() else False,
                  "RFC3551 L16 non-44.1k uses dynamic PT", f"pt={apt} rtpmap={enc}")
 
+# -- Resolve per-media SETUP targets from a=control (RFC 2326 §C.1.1);
+#    backends differ (compy: video/audio, live555: track1/track2) --
+track_url = {}
+cur = None
+for line in sdp.splitlines():
+    if line.startswith("m="):
+        cur = "video" if line[2:].startswith("video") else \
+              "audio" if line[2:].startswith("audio") else None
+    elif line.startswith("a=control:") and cur:
+        c = line.split(":", 1)[1].strip()
+        track_url[cur] = c if c.startswith("rtsp://") else url.rstrip("/") + "/" + c
+vurl = track_url.get("video", url + "/video")
+aurl = track_url.get("audio", url + "/audio")
+
 # -- SETUP both tracks, PLAY, RTP-Info --
 sess = None
-head, _, _ = req("SETUP", url + "/video", "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n")
+head, _, _ = req("SETUP", vurl, "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n")
 for l in head.split("\r\n"):
     if l.lower().startswith("session"):
         sess = l.split(":")[1].split(";")[0].strip()
@@ -153,14 +160,24 @@ emit(sess is not None, "RFC2326 SETUP returns Session", head.split("\r\n")[0])
 if not sess:
     sys.exit(0)
 if has_audio:
-    req("SETUP", url + "/audio", f"Transport: RTP/AVP/TCP;unicast;interleaved=2-3\r\nSession: {sess}\r\n")
+    req("SETUP", aurl, f"Transport: RTP/AVP/TCP;unicast;interleaved=2-3\r\nSession: {sess}\r\n")
 head, _, leftover = req("PLAY", url, f"Session: {sess}\r\nRange: npt=0.000-\r\n")
 rtpinfo = {}
+# Match each RTP-Info entry to a media by its control URL's last
+# segment (backends name tracks differently, and live555 lists extra
+# tracks like track3 that must not be misfiled as video/audio).
+last_seg = {media: turl.rsplit("/", 1)[-1] for media, turl in
+            {"video": vurl, "audio": aurl}.items()}
 for l in head.split("\r\n"):
     if l.lower().startswith("rtp-info"):
         for part in l.split(":", 1)[1].split(","):
             d = dict(kv.split("=", 1) for kv in part.strip().split(";") if "=" in kv)
-            key = "audio" if "audio" in d.get("url", "") else "video"
+            u = d.get("url", "").rstrip("/")
+            key = next((m for m, seg in last_seg.items() if u.endswith("/" + seg)), None)
+            if key is None:
+                key = "audio" if "audio" in u else "video" if "video" in u else None
+            if key is None:
+                continue
             try:
                 rtpinfo[key] = (int(d["seq"]), int(d["rtptime"]))
             except (KeyError, ValueError):
@@ -292,7 +309,7 @@ try:
                      "Accept: application/sdp\r\n")
     code = head.split("\r\n")[0]
     emit(any(c in code for c in ("404", "403", "454")), "robustness: bogus path rejected", code)
-    head, _, _ = req("SETUP", url + "/video", "Transport: GARBAGE/NONSENSE;foo=bar\r\n")
+    head, _, _ = req("SETUP", vurl, "Transport: GARBAGE/NONSENSE;foo=bar\r\n")
     code = head.split("\r\n")[0]
     emit(any(c in code for c in ("400", "461", "451")), "robustness: garbage transport rejected", code)
     head, _, _ = req("PLAY", url, "Session: 424242424242\r\n")

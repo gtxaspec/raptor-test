@@ -92,11 +92,33 @@ class RtspSession:
 
     def describe(self):
         status, headers, sdp = self.request("DESCRIBE", extra="Accept: application/sdp\r\n")
+        # Map each media type to its SETUP target from a=control
+        # (RFC 2326 §C.1.1): backends differ (compy: video/audio,
+        # live555: track1/track2), so never assume the suffix.
+        base = headers.get("content-base", "").strip() or self.url
+        self.tracks = {}
+        media = None
+        for line in sdp.splitlines():
+            if line.startswith("m="):
+                media = "video" if line[2:].startswith("video") else \
+                        "audio" if line[2:].startswith("audio") else None
+            elif line.startswith("a=control:") and media:
+                ctl = line.split(":", 1)[1].strip()
+                if ctl == "*":
+                    self.tracks[media] = base.rstrip("/")
+                elif ctl.startswith("rtsp://"):
+                    self.tracks[media] = ctl
+                else:
+                    self.tracks[media] = base.rstrip("/") + "/" + ctl
         return status, sdp
 
-    def setup(self, track, ch):
+    def track_url(self, media):
+        """SETUP target for a media type, from the parsed a=control."""
+        return getattr(self, "tracks", {}).get(media, self.url + "/" + media)
+
+    def setup(self, media, ch):
         return self.request(
-            "SETUP", self.url + "/" + track,
+            "SETUP", self.track_url(media),
             extra=f"Transport: RTP/AVP/TCP;unicast;interleaved={ch}-{ch + 1}\r\n")
 
     def play(self):

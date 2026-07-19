@@ -41,6 +41,7 @@ RECDIR=""
 RTSP_USER=""
 RTSP_PASS=""
 RHD_URL=""
+SRT_URL=""
 while [ $# -gt 0 ]; do
     case "$1" in
     --sub) SUB_URL=$2; shift 2 ;;
@@ -53,6 +54,7 @@ while [ $# -gt 0 ]; do
     --user) RTSP_USER=$2; shift 2 ;;
     --pass) RTSP_PASS=$2; shift 2 ;;
     --rhd) RHD_URL=$2; shift 2 ;;
+    --srt) SRT_URL=$2; shift 2 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -777,6 +779,45 @@ EOF
     fi
 else
     skip "go2rtc leg (--go2rtc not given)"
+fi
+
+# ── 9c. SRT: MPEG-TS over SRT (rsr) (--srt) ──
+if [ -n "$SRT_URL" ]; then
+    # Accept host:port or a full srt:// URL; connect as a caller.
+    case "$SRT_URL" in srt://*) SU=$SRT_URL ;; *) SU="srt://$SRT_URL" ;; esac
+    case "$SU" in *\?*) : ;; *) SU="$SU?mode=caller&latency=120000" ;; esac
+    SRT_STREAMS=$("$FFPROBE" -v error -show_entries stream=codec_type -of csv=p=0 \
+        "$SU" 2>/dev/null | grep -vE '^$' | sort -u | tr '\n' ' ')
+    SRT_STREAMS=$(echo "$SRT_STREAMS")  # collapse stray whitespace
+    if echo "$SRT_STREAMS" | grep -q video; then
+        ok "SRT: MPEG-TS carries video ($SRT_STREAMS)"
+    else
+        bad "SRT stream" "no video stream (${SRT_STREAMS:-none})"
+    fi
+    "$FFMPEG" -nostdin -v error -i "$SU" -t "$DUR" -map 0:v -f null - \
+        >"$WORK/srt_v.log" 2>&1
+    if [ "$(grep -ciE "$ERRPAT" "$WORK/srt_v.log")" -eq 0 ]; then
+        ok "SRT: video decodes clean (${DUR}s)"
+    else
+        bad "SRT video decode" "see $WORK/srt_v.log"
+        show_errs "$WORK/srt_v.log"
+    fi
+    # Decode audio all the way to PCM: a wrong ADTS sample rate (the TS
+    # muxer mislabeling HE-AAC) yields "scalefactor bands exceeds limit"
+    # and zero samples, which a container-level check would miss.
+    if echo "$SRT_STREAMS" | grep -q audio; then
+        "$FFMPEG" -nostdin -v error -i "$SU" -t "$DUR" -map 0:a -f s16le \
+            "$WORK/srt_a.raw" >"$WORK/srt_a.log" 2>&1
+        SB=$(wc -c <"$WORK/srt_a.raw" 2>/dev/null)
+        AE=$(grep -ciE "$ERRPAT|scalefactor|exceeds limit" "$WORK/srt_a.log")
+        if [ "${SB:-0}" -gt 10000 ] && [ "$AE" -eq 0 ]; then
+            ok "SRT: audio decodes to PCM ($SB bytes, no errors)"
+        else
+            bad "SRT audio decode" "${SB:-0} PCM bytes, $AE errors (ADTS rate mislabel?)"
+            show_errs "$WORK/srt_a.log"
+        fi
+        rm -f "$WORK/srt_a.raw"
+    fi
 fi
 
 # ── 10. Frigate record + clip verification (--frigate, docker) ──
