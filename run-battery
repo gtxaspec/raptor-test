@@ -80,6 +80,7 @@ battery_for_target() {
     RTSP_PORT=554; PATH0=stream0; PATH1=stream1
     R555_PORT=''; R555_PATH0=stream0; R555_PATH1=stream1
     GO2RTC=''; FRIGATE=no; RECORD_CHECK=''; NOTES=''
+    TLS=''; RTMP=''
     # shellcheck disable=SC1090
     . "$conf"
     CURRENT_TARGET=$name
@@ -98,9 +99,12 @@ battery_for_target() {
     [ -n "$RECORD_CHECK" ] && common+=(--record-check "$RECORD_CHECK")
     [ -n "$RHD" ]          && common+=(--rhd "$RHD")
 
-    # Backend 1: rsd (compy) — carries the SRT leg too (SRT is a flag).
+    # Backend 1: rsd (compy) — also carries the backend-independent
+    # legs (SRT, TLS, RTMP) since it is always present.
     local -a rsd_args=("${common[@]}")
-    [ -n "$SRT" ] && rsd_args+=(--srt "$SRT")
+    [ -n "$SRT" ]  && rsd_args+=(--srt "$SRT")
+    [ -n "$TLS" ]  && rsd_args+=(--tls "$TLS")
+    [ -n "$RTMP" ] && rsd_args+=(--rtmp "$RTMP")
     run_suite "rsd (compy RTSP)" \
         "rtsp://$HOST:$RTSP_PORT/$PATH0" \
         --sub "rtsp://$HOST:$RTSP_PORT/$PATH1" "${rsd_args[@]}"
