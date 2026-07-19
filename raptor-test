@@ -638,7 +638,12 @@ fi
 mpv_check() {
     local name=$1 turl=$2
     shift 2
-    mpv --no-config --vo=null --ao=null "$@" --length=10 "$turl" >"$WORK/$name.log" 2>&1
+    # Hard timeout: --length=10 relies on playback progressing, but a
+    # stalled decoder (e.g. a backend mislabeling its audio) leaves mpv
+    # spinning forever. A wrapper timeout keeps one bad player from
+    # wedging the whole suite.
+    timeout -k 5 25 mpv --no-config --vo=null --ao=null "$@" --length=10 \
+        "$turl" >"$WORK/$name.log" 2>&1
     local errs
     errs=$(tr '\r' '\n' <"$WORK/$name.log" | grep -ciE "$ERRPAT")
     local av
