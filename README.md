@@ -90,6 +90,7 @@ fails (`--keep-logs` keeps them always).
 | live555 client | openRTSP (VLC's RTSP lineage, a different stack than libav) negotiates a session and its dumped elementary stream decodes clean — exercises server paths ffmpeg/mpv cannot |
 | RTSPS/TLS | (`--tls rtsps://host:port/path`) TLS handshake, DESCRIBE 200 over rtsps, and clean media through the encrypted transport |
 | RTMP push | (`--rtmp <listen-port>`) rsp pushes to a listener on this host; the received FLV carries video and decodes clean (catches HE-AAC ASC mislabels on the push path) |
+| WebRTC | (`--webrtc <whip-url>`) a real WHIP client (aiortc: SDP/ICE/DTLS-SRTP) decodes rwd's stream and measures framerate, stall stability, PTS monotonicity/cadence, and that audio decodes to real samples (Opus or G.711). Point at an **H264** stream (`?stream=N`) — rwd's WebRTC video is H264-only; signaling is HTTPS with Basic auth. Needs `tools/webrtc-venv` (fetch-tools.sh) |
 | go2rtc | Clean media through a restream; AAC `config=` passed through verbatim |
 | Frigate | Dockerized Frigate records via TCP and UDP inputs; recorded clips verified |
 | RHD HTTP | (`--rhd`) `/snap` returns a decodable JPEG of sane size (and refuses unauthenticated access when credentials are set); `/mjpeg` is `multipart/x-mixed-replace` carrying multiple JPEG parts that decode frame-by-frame with no errors |
@@ -138,7 +139,7 @@ with exact wire cadence (G.711 modal 160, opus modal 960 at 100%).
 
 ## Not covered (yet)
 
-RTP-level MJPEG (rsd's `/jpeg`), WHIP/WebRTC (rwd), backchannel
+RTP-level MJPEG (rsd's `/jpeg`), WebRTC backchannel (talk-back)
 audio, and multi-hour soak runs (a `--soak` mode with RSS/FD trending
 is the natural shape). The raptor provenance suite
 separately covers snapshots, EXIF, signing, and rverify chains.

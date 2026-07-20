@@ -44,6 +44,7 @@ RHD_URL=""
 SRT_URL=""
 TLS_URL=""
 RTMP_PORT=""
+WEBRTC_URL=""
 while [ $# -gt 0 ]; do
     case "$1" in
     --sub) SUB_URL=$2; shift 2 ;;
@@ -59,6 +60,7 @@ while [ $# -gt 0 ]; do
     --srt) SRT_URL=$2; shift 2 ;;
     --tls) TLS_URL=$2; shift 2 ;;
     --rtmp) RTMP_PORT=$2; shift 2 ;;
+    --webrtc) WEBRTC_URL=$2; shift 2 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -948,6 +950,28 @@ if [ -n "$RTMP_PORT" ]; then
     else
         bad "RTMP push" "nothing received on :$RTMP_PORT in 25s (is [push] url set to this host?)"
         tail -2 "$WORK/rtmp_listen.log" | sed 's/^/          /'
+    fi
+fi
+
+# ── 9f. WebRTC (--webrtc <whip-url>): real WHIP/ICE/DTLS-SRTP client ──
+# Measures decoded video framerate, stall stability, PTS discipline,
+# and that audio decodes to real samples. Video requires an H264
+# stream (rwd's WebRTC path is H264-only; point at the H264 sub).
+if [ -n "$WEBRTC_URL" ]; then
+    WVENV="$DIR/tools/webrtc-venv/bin/python"
+    if [ -x "$WVENV" ]; then
+        WRTC=$(timeout -k 5 45 "$WVENV" "$PROBES/webrtc_check.py" "$WEBRTC_URL" \
+            "${RTSP_USER:-}" "${RTSP_PASS:-}" 12 0 2>&1)
+        echo "$WRTC" >"$WORK/webrtc.txt"
+        while IFS= read -r line; do
+            case $line in
+                OK\ *)   ok "${line#OK }" ;;
+                FAIL\ *) bad "${line#FAIL }" ;;
+                SKIP\ *) skip "${line#SKIP }" ;;
+            esac
+        done <<< "$WRTC"
+    else
+        skip "WebRTC leg (tools/webrtc-venv missing — run tools/fetch-tools.sh)"
     fi
 fi
 

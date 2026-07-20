@@ -80,7 +80,7 @@ battery_for_target() {
     RTSP_PORT=554; PATH0=stream0; PATH1=stream1
     R555_PORT=''; R555_PATH0=stream0; R555_PATH1=stream1
     GO2RTC=''; FRIGATE=no; RECORD_CHECK=''; NOTES=''
-    TLS=''; RTMP=''
+    TLS=''; RTMP=''; WEBRTC=''
     # shellcheck disable=SC1090
     . "$conf"
     CURRENT_TARGET=$name
@@ -105,6 +105,7 @@ battery_for_target() {
     [ -n "$SRT" ]  && rsd_args+=(--srt "$SRT")
     [ -n "$TLS" ]  && rsd_args+=(--tls "$TLS")
     [ -n "$RTMP" ] && rsd_args+=(--rtmp "$RTMP")
+    [ -n "$WEBRTC" ] && rsd_args+=(--webrtc "$WEBRTC")
     run_suite "rsd (compy RTSP)" \
         "rtsp://$HOST:$RTSP_PORT/$PATH0" \
         --sub "rtsp://$HOST:$RTSP_PORT/$PATH1" "${rsd_args[@]}"

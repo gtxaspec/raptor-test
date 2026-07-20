@@ -42,3 +42,12 @@ if [ ! -x openRTSP ]; then
 fi
 ./openRTSP 2>&1 | head -1 || true
 echo "installed into $(pwd)"
+
+# WebRTC client (aiortc) — a real WHIP/ICE/DTLS-SRTP client for the
+# --webrtc leg. Lives in a venv because aiortc needs PyAV.
+if [ ! -x webrtc-venv/bin/python ]; then
+    echo "creating webrtc venv (aiortc) ..."
+    python3 -m venv webrtc-venv
+    ./webrtc-venv/bin/pip install --quiet aiortc av aiohttp
+fi
+./webrtc-venv/bin/python -c "import aiortc; print('aiortc', aiortc.__version__)"
