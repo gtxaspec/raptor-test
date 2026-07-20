@@ -81,8 +81,16 @@ battery_for_target() {
     R555_PORT=''; R555_PATH0=stream0; R555_PATH1=stream1
     GO2RTC=''; FRIGATE=no; RECORD_CHECK=''; NOTES=''
     TLS=''; RTMP=''; WEBRTC=''
+    # A syntax error (e.g. unquoted parens in NOTES) makes bash abort
+    # sourcing mid-file, silently dropping every field after the bad
+    # line. That must be a hard error, never a partial run.
     # shellcheck disable=SC1090
-    . "$conf"
+    if ! . "$conf"; then
+        echo "CONF PARSE ERROR: $conf -- quote values containing spaces or ()" >&2
+        printf '%s\t%s\tCONF PARSE ERROR\n' "$name" "-" >>"$MATRIX_FILE"
+        OVERALL_FAIL=1
+        return
+    fi
     CURRENT_TARGET=$name
 
     echo "================================================================"
