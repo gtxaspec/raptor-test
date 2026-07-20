@@ -14,9 +14,9 @@ test once missed the bug it now catches.
 ## Running the whole battery on a target
 
 `raptor-test` checks one endpoint per invocation. To run the *entire*
-battery — every backend (rsd, rsd-555, SRT) and every leg — the same
-way on every device, use `run-battery` with a target manifest so
-coverage can't drift between targets:
+battery — every backend (rsd, rsd-555, SRT, RTMP, WebRTC, RHD) and
+every leg — the same way on every device, use `run-battery` with a
+target manifest so coverage can't drift between targets:
 
 ```sh
 ./run-battery t23-cinnado      # one target, all its backends
@@ -41,25 +41,34 @@ tests, it doesn't manage the lab.
     --frigate \                          # dockerized Frigate record + clip verify
     --record-check /path/to/recordings \ # verify an external recorder's newest clip
     --user admin --pass secret \        # digest credentials (deployed cameras)
-    --rhd https://CAM:8443 \            # RHD HTTP: JPEG snapshot + MJPEG stream
-    --srt srt://CAM:9000                 # SRT (rsr): MPEG-TS video+audio decode
+    --rhd https://CAM:8443 \            # RHD HTTP: snapshot, MJPEG, /audio
+    --srt srt://CAM:9000 \               # SRT (rsr): MPEG-TS video+audio decode
+    --tls rtsps://CAM:9554/ch0 \         # RTSPS/TLS leg (needs [rtsp] tls=true)
+    --rtmp 1935 \                        # receive rsp's RTMP push on this port
+    --webrtc https://CAM:8554/whip?stream=1  # WebRTC via rwd WHIP (H264 stream)
 ```
 
 Point the RTSP URL at any backend: raptor's compy server (`rsd`) or
 its live555 server (`rsd-555`) on its own port. The probes read each
 media's `a=control` from the SDP, so track naming differences between
-backends are handled transparently. One known live555 difference: it
-answers a malformed `Transport` header with 200 instead of 461, so the
-garbage-transport robustness check reports a failure against rsd-555 —
-that is upstream live555 leniency, not an rsd-555 defect.
+backends are handled transparently. Two known live555 differences,
+both upstream library behavior rather than rsd-555 defects: it answers
+a malformed `Transport` header with 200 instead of 461
+(`parseTransportHeader` defaults to RTP/UDP and ignores tokens it
+doesn't recognize), so the garbage-transport robustness check reports
+a failure against rsd-555; and its PAUSE check can flake under heavy
+device load (one in-flight frame after PAUSE while the pre-window is
+starved) — it passes consistently on an idle device.
 
 Requires `ffmpeg`/`ffprobe` and `python3`; uses `mpv` and `docker`
-when present. Run `tools/fetch-tools.sh` once to pin an official
-ffmpeg 8 static build in `tools/` -- the suite prefers it over the
-system ffmpeg (client RTSP behavior shifts between majors: 7.1
-streamcopy silently drops RTSP AAC audio, 8.x fixed it). An explicit
-`FFMPEG`/`FFPROBE` env override still wins, and every run logs the
-client version it used. Logs land in
+when present. Run `tools/fetch-tools.sh` once — it pins an official
+ffmpeg 8 static build in `tools/` (the suite prefers it over the
+system ffmpeg: client RTSP behavior shifts between majors — 7.1
+streamcopy silently drops RTSP AAC audio, 8.x fixed it), builds
+`openRTSP` from live555 source for the live555-client leg, and
+provisions `tools/webrtc-venv` (aiortc) for the `--webrtc` leg. An
+explicit `FFMPEG`/`FFPROBE` env override still wins, and every run
+logs the client version it used. Logs land in
 `./raptor-test-logs/<timestamp>/` and are kept whenever anything
 fails (`--keep-logs` keeps them always).
 
@@ -126,6 +135,17 @@ fails (`--keep-logs` keeps them always).
   spikes, audio cadence stability) exist because a steering loop that
   bang-bangs +-1ms passes every decode check while file muxers
   silently drop packets around the jitter.
+- Every external client call is wall-clock bounded. An SRT caller
+  blocks forever against a listener that completes the handshake but
+  never sends data (one wedged rsr hung a full battery for 40
+  minutes), and ffmpeg's `-t` only limits capture *after* connect.
+  Bounded captures also require ffmpeg rc=0: a mid-capture stall
+  killed by `timeout` leaves an empty error log, which a grep-only
+  check would read as a vacuous "decodes clean" pass.
+- Target manifests are sourced bash; a quoting error aborts sourcing
+  mid-file and silently drops every later field. `run-battery`
+  hard-errors on a conf that fails to source instead of running a
+  partial battery that still looks green.
 
 ## Codec and rate matrices
 
