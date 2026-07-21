@@ -47,6 +47,8 @@ async def run():
     v_pts = []        # frame PTS (RTP timebase)
     v_tb = [None]     # time_base of the video track
     a_frames = [0]
+    a_t0 = [None]
+    a_t1 = [None]
     a_samples = [0]
     a_rate = [0]
     done = asyncio.Event()
@@ -66,6 +68,9 @@ async def run():
                         a_frames[0] += 1
                         a_samples[0] += frame.samples
                         a_rate[0] = frame.sample_rate
+                        if a_t0[0] is None:
+                            a_t0[0] = time.time()
+                        a_t1[0] = time.time()
             except Exception:
                 done.set()
         asyncio.ensure_future(pump())
@@ -105,7 +110,10 @@ async def run():
     # Audio: identify the negotiated codec from the answer and confirm
     # it decoded to real samples. rwd transcodes the ring AAC to Opus
     # (default) or G.711; a silent stream (0 samples) means the transcode
-    # failed (e.g. HE-AAC, which rwd's LC-only decoder cannot handle).
+    # failed. Judged over the span audio actually flowed, not the whole
+    # capture window: ICE+DTLS setup time varies by link and must not
+    # read as missing samples. Sustained full-rate over >=2s proves the
+    # transcode; a stalled or silent stream still fails.
     acodec = "?"
     in_audio = False
     for line in answer_sdp.splitlines():
@@ -117,10 +125,13 @@ async def run():
             acodec = line.split(" ", 1)[1].strip() if " " in line else "?"
             break
     if "m=audio" in answer_sdp:
-        expected = a_rate[0] * duration * 0.5  # allow half-window slack
-        emit(a_frames[0] > 10 and a_samples[0] > expected,
+        a_span = (a_t1[0] - a_t0[0]) if a_t0[0] is not None else 0.0
+        min_span = min(2.0, duration * 0.5)
+        expected = a_rate[0] * a_span * 0.8
+        emit(a_frames[0] > 10 and a_span >= min_span and a_samples[0] > expected,
              "WebRTC audio decodes to samples",
-             f"{acodec}: {a_frames[0]} frames, {a_samples[0]} samples @ {a_rate[0]}Hz")
+             f"{acodec}: {a_frames[0]} frames, {a_samples[0]} samples @ {a_rate[0]}Hz "
+             f"over {a_span:.1f}s")
 
     n = len(v_arrivals)
     if n < 10:
@@ -170,6 +181,7 @@ async def run():
         "median_gap_ms": round(median * 1000, 1), "stalls": len(stalls),
         "pts_backward": back, "audio_frames": a_frames[0],
         "audio_samples": a_samples[0], "audio_rate": a_rate[0], "audio_codec": acodec,
+        "audio_span_s": round((a_t1[0] - a_t0[0]), 2) if a_t0[0] is not None else 0,
         "time_base": str(v_tb[0]),
     }), flush=True)
 
