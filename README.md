@@ -85,6 +85,9 @@ listed, logs kept), 2 = usage error.
 | Wire level | RTP sequence continuity per track via a raw interleaved probe; RTP timestamp discipline: never backward, single-packet spikes triaged against wall-clock arrival (honest source gap vs timestamp anomaly), audio cadence modal share with nudge-direction split (one-sided = tracking a real source clock, two-sided = oscillating steering) |
 | Timestamps | Real capture: per-track monotonicity in native timebases, A/V end alignment; audio cadence vs nominal rate in ppm (catches source-clock drift) |
 | Content | Measured video fps vs nominal (within 15%), resolution sanity, decoded audio sample count vs declared rate (catches SBR/rate mislabels), GOP cadence from a raw bitstream census, per-frame SEI presence (raptor ST 0604; skipped when absent) |
+| GOP adherence | Keyframes must be strictly periodic (census interval modal +/- 1 frame; drifting or elastic GOPs break recorder segmenting); with `--gop <n>` (`GOP=` in a manifest) the measured interval must equal the configured value |
+| Backchannel | Auto-detected: DESCRIBE with the ONVIF Require header; if the server advertises an `a=sendonly` audio section, SETUP it and push real PCMU RTP at the server — the session must survive and, with `--ssh`, the speaker ring must exist on the device mid-session (found a real demand-accounting bug in rsd's jpeg path the day it was written) |
+| MJPEG over RTSP | Auto-detected: the `/jpeg` endpoint (rsd default) must deliver decodable RFC 2435 MJPEG, not just answer signaling |
 | RTSP behavior | PAUSE halts delivery and PLAY resumes; malformed requests (bogus path, garbage transport, unknown session) answered with 4xx and the server stays healthy |
 | Sessions | A silently-vanished UDP client (no teardown, no keepalive, no RTCP) must stop receiving media within the advertised Session timeout and be reaped server-side; mid-session TCP-to-UDP re-SETUP either moves the media or is refused 455 with the session intact |
 | Auth | (`--user/--pass`) unauthenticated DESCRIBE draws a Digest challenge, unauthenticated SETUP is refused, wrong password rejected, correct digest accepted; the whole suite then runs authenticated (probes speak digest, client legs carry URL credentials) |
@@ -111,7 +114,7 @@ listed, logs kept), 2 = usage error.
 | SRT | (`--srt`) connects as a caller to the SRT listener (rsr), confirms the MPEG-TS carries video, decodes the video clean, and decodes the audio all the way to PCM — the last step catches an ADTS sample-rate mislabel that a container probe would miss |
 | Codec matrix | `tools/codec-matrix.sh` sweeps l16/pcmu/pcma/opus/aac against **both** RTSP backends per codec, asserting the audio RTP timestamp step equals the codec's real frame duration (a server timestamping AAC at its 20ms chunk rate decodes fine but runs the clock 3x fast) |
 | Clips | Recorded files: streams present, durations aligned, full decode with zero errors (null-muxer dts nag and its repeat-tails excluded; file-level dts asserted to never move backward instead) |
-| Device | (`--ssh`) rsd CPU sane after the suite, connection count back at the pre-suite baseline |
+| Device | (`--ssh`) rsd CPU sane after the suite, connection count back at the pre-suite baseline, daemon log lines emitted during the run free of ERROR-level entries and crashes, framesource "losted buffers" counters flat across the run |
 
 ## Design notes
 
@@ -163,7 +166,8 @@ with exact wire cadence (G.711 modal 160, opus modal 960 at 100%).
 
 ## Not covered (yet)
 
-RTP-level MJPEG (rsd's `/jpeg`), WebRTC backchannel (talk-back)
-audio, and multi-hour soak runs (a `--soak` mode with RSS/FD trending
-is the natural shape). The raptor provenance suite
+WebRTC talk-back validation (the probe offers a sendrecv audio
+track; judging the far end needs a live rwd), audio-only RTSP
+sources, and multi-hour soak runs (a `--soak` mode with RSS/FD
+trending is the natural shape). The raptor provenance suite
 separately covers snapshots, EXIF, signing, and rverify chains.
