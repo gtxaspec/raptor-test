@@ -113,7 +113,11 @@ def main():
         seq += 1
         ts += 160
         time.sleep(0.018)
-    print(f"BC_SENT={sent}")
+    print(f"BC_SENT={sent}", flush=True)
+
+    # Hold the session so the caller can verify device-side evidence
+    # (rsd destroys the speaker ring at teardown by design).
+    time.sleep(2.5)
 
     st, _, _ = s.request("GET_PARAMETER")
     print(f"BC_ALIVE={'yes' if '200' in st else code(st)}")

@@ -892,9 +892,26 @@ fi
 # rsd advertises an a=sendonly audio section when [rtsp] backchannel
 # is enabled; the probe DESCRIBEs with the ONVIF Require header and,
 # if the track is there, pushes real RTP audio at the server.
-BCOUT=$(timeout -k 3 40 python3 "$PROBES/backchannel.py" "$HOST" "$PORT" "$RPATH" \
-    "${RTSP_USER:-}" "${RTSP_PASS:-}" 2>"$WORK/backchannel.err")
-echo "$BCOUT" >"$WORK/backchannel.txt"
+timeout -k 3 40 python3 "$PROBES/backchannel.py" "$HOST" "$PORT" "$RPATH" \
+    "${RTSP_USER:-}" "${RTSP_PASS:-}" >"$WORK/backchannel.txt" 2>"$WORK/backchannel.err" &
+BCPID=$!
+# The probe holds the session ~2.5s after BC_SENT; the speaker ring
+# exists only DURING the session (destroyed at teardown), so check
+# device evidence in that window.
+BCRING="unchecked"
+if [ -n "$SSH_TARGET" ]; then
+    for i in $(seq 1 60); do
+        grep -q 'BC_SENT=' "$WORK/backchannel.txt" 2>/dev/null && break
+        kill -0 $BCPID 2>/dev/null || break
+        sleep 0.5
+    done
+    if grep -q 'BC_SENT=' "$WORK/backchannel.txt" 2>/dev/null; then
+        ssh -o ConnectTimeout=5 "$SSH_TARGET" 'test -e /dev/shm/rss_ring_speaker' 2>/dev/null \
+            && BCRING="yes" || BCRING="no"
+    fi
+fi
+wait $BCPID 2>/dev/null
+BCOUT=$(cat "$WORK/backchannel.txt")
 if ! echo "$BCOUT" | grep -q 'BC_DESCRIBE=200'; then
     skip "backchannel (DESCRIBE with ONVIF Require not accepted)"
 elif ! echo "$BCOUT" | grep -q 'BC_SENDONLY=yes'; then
@@ -909,12 +926,10 @@ else
     else
         bad "backchannel audio send" "sent=${BCSENT:-0} alive=${BCALIVE:-none} (see backchannel.txt)"
     fi
-    if [ -n "$SSH_TARGET" ]; then
-        if ssh -o ConnectTimeout=8 "$SSH_TARGET" 'test -e /dev/shm/rss_ring_speaker' 2>/dev/null; then
-            ok "speaker ring created on device (backchannel audio landed)"
-        else
-            bad "speaker ring on device" "/dev/shm/rss_ring_speaker missing after backchannel audio"
-        fi
+    if [ "$BCRING" = "yes" ]; then
+        ok "speaker ring live on device during backchannel session"
+    elif [ "$BCRING" = "no" ]; then
+        bad "speaker ring on device" "missing mid-session (audio not landing)"
     fi
 fi
 
