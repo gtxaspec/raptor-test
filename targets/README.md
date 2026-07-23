@@ -4,7 +4,10 @@ One file per lab device, sourced by `run-battery`. Each defines where
 the device is and which backends/legs it exposes, so the **same full
 battery** runs on every target — nothing is chosen ad-hoc at run time.
 
-Copy `_template.conf` to `<name>.conf` and fill it in. Fields left
+Copy `_template.conf` to `<name>.conf` and fill it in. Site confs
+(`targets/*.conf`) are deliberately untracked -- they hold your lab's
+IPs and layout and never belong in the repo; only the template is.
+Fields left
 empty (or `-`) mark a leg as not-applicable for that target; the
 runner records it as `n/a` rather than silently skipping it.
 

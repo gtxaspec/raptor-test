@@ -5,3 +5,7 @@ tools/ffmpeg
 tools/ffprobe
 tools/openRTSP
 tools/webrtc-venv/
+.ruff_cache/
+# site target manifests stay local (lab IPs etc); the template is tracked
+targets/*.conf
+!targets/_template.conf
