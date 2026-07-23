@@ -66,11 +66,15 @@ ffmpeg 8 static build in `tools/` (the suite prefers it over the
 system ffmpeg: client RTSP behavior shifts between majors — 7.1
 streamcopy silently drops RTSP AAC audio, 8.x fixed it), builds
 `openRTSP` from live555 source for the live555-client leg, and
-provisions `tools/webrtc-venv` (aiortc) for the `--webrtc` leg. An
+provisions `tools/webrtc-venv` (aiortc) for the `--webrtc` leg. Building
+openRTSP needs `make` and a C++20-capable `g++` (fetch-tools skips it
+with a warning otherwise; the live555-client leg then self-skips). An
 explicit `FFMPEG`/`FFPROBE` env override still wins, and every run
 logs the client version it used. Logs land in
 `./raptor-test-logs/<timestamp>/` and are kept whenever anything
-fails (`--keep-logs` keeps them always).
+fails (`--keep-logs` keeps them always). Exit codes: 0 = every check
+passed (skips allowed), 1 = at least one check failed (failed names
+listed, logs kept), 2 = usage error.
 
 ## What it checks
 

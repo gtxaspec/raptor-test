@@ -26,7 +26,9 @@ rm -rf "/tmp/$D" "/tmp/$ASSET"
 # libav (ffmpeg/mpv). Built from live555 source: LIVE555_SRC points at
 # a checkout (default: the raptor build's .deps/live), else downloaded.
 LIVE555_SRC=${LIVE555_SRC:-../../raptor/.deps/live}
-if [ ! -x openRTSP ]; then
+if [ ! -x openRTSP ] && ! command -v g++ >/dev/null 2>&1; then
+    echo "WARNING: g++ not found - skipping the openRTSP build (the live555-client leg will self-skip)"
+elif [ ! -x openRTSP ]; then
     SRC=$(mktemp -d)
     if [ -d "$LIVE555_SRC/testProgs" ]; then
         cp -r "$LIVE555_SRC" "$SRC/live"
@@ -48,6 +50,6 @@ echo "installed into $(pwd)"
 if [ ! -x webrtc-venv/bin/python ]; then
     echo "creating webrtc venv (aiortc) ..."
     python3 -m venv webrtc-venv
-    ./webrtc-venv/bin/pip install --quiet aiortc av aiohttp
+    ./webrtc-venv/bin/pip install --quiet 'aiortc==1.15.*' 'av==17.*' 'aiohttp==3.*'
 fi
 ./webrtc-venv/bin/python -c "import aiortc; print('aiortc', aiortc.__version__)"
