@@ -9,18 +9,8 @@
 # Every check exists because an ad-hoc test once missed the bug it
 # now catches.
 #
-# Usage:
-#   raptor-test <rtsp-url> [options]
-#
-# Options:
-#   --sub <url>        second stream URL (concurrency mix; default: main url)
-#   --ssh <user@host>  enable device-side health checks (raptor bench)
-#   --duration <s>     base capture duration (default 12)
-#   --go2rtc <apiurl>  test through a go2rtc restream (e.g. http://host:1984)
-#   --frigate          record via a local dockerized Frigate (both transports)
-#                      and verify the recorded clips
-#   --record-check <d> verify the newest .mp4 in a directory (e.g. rmr output)
-#   --keep-logs        keep the log directory even on success
+# Usage: raptor-test <rtsp-url> [options] -- run with --help for the
+# full option list and exit codes.
 #
 # Requirements: ffmpeg+ffprobe (FFMPEG/FFPROBE env override), python3.
 # mpv used if present. All log matching is case-insensitive; failing
@@ -29,8 +19,40 @@
 # kill only a timeout wrapper (orphaned ffmpeg streams forever).
 set -u
 
-URL=${1:?usage: raptor-test <rtsp-url> [--sub url] [--ssh user@host] [--user u --pass p] [--duration s] [--keep-logs]}
+usage() {
+    cat <<'EOF'
+usage: raptor-test <rtsp-url> [options]
+
+Options:
+  --sub <url>          second stream URL (concurrency mix; default: main url)
+  --ssh <user@host>    enable device-side health checks (raptor bench)
+  --user <u> --pass <p>  RTSP digest credentials (enables the auth battery)
+  --duration <s>       base capture duration (default 12)
+  --go2rtc <apiurl>    test through a go2rtc restream (e.g. http://host:1984)
+  --frigate            record via a local dockerized Frigate, verify the clips
+  --record-check <d>   verify the newest .mp4 in a directory (e.g. rmr output)
+  --rhd <baseurl>      RHD HTTP checks: /snap, /mjpeg, /audio (https://host:8443)
+  --srt <url>          SRT leg (srt://host:9000): MPEG-TS video+audio decode
+  --tls <rtsps-url>    RTSPS/TLS leg (server needs [rtsp] tls=true)
+  --rtmp <port>        listen for rsp's RTMP push on this port
+  --webrtc <whip-url>  WebRTC leg via rwd WHIP (H264 stream; needs webrtc-venv)
+  --keep-logs          keep the log directory even on success
+  -h, --help           this text
+
+Exit codes: 0 all checks passed (skips allowed), 1 at least one check
+failed (names listed, logs kept), 2 usage error.
+EOF
+}
+case "${1:-}" in
+-h|--help) usage; exit 0 ;;
+esac
+[ $# -ge 1 ] || { echo "usage: raptor-test <rtsp-url> [options]   (--help for the full list)" >&2; exit 2; }
+URL=$1
 shift
+case "$URL" in
+rtsp://*) ;;
+*) echo "error: first argument must be an rtsp:// URL (got: $URL)" >&2; exit 2 ;;
+esac
 SUB_URL=""
 SSH_TARGET=""
 DUR=12
@@ -177,8 +199,12 @@ capture() {
     local targ=()
     [ -n "$transport" ] && targ=(-rtsp_transport "$transport")
     timeout -k 5 $((secs + 14)) "$FFMPEG" -nostdin -v warning "${targ[@]}" -i "$url" \
-        -t "$secs" -f null - >"$WORK/$name.log" 2>&1
-    [ "$(grep -ciE "$ERRPAT" "$WORK/$name.log")" -eq 0 ]
+        -t "$secs" -progress "$WORK/$name.progress" -f null - >"$WORK/$name.log" 2>&1
+    # zero error lines AND real decoded video: a client that exits 0
+    # without ever producing frames (bad URL, own help text) must FAIL
+    local frames
+    frames=$(sed -n 's/^frame=//p' "$WORK/$name.progress" 2>/dev/null | tail -1)
+    [ "$(grep -ciE "$ERRPAT" "$WORK/$name.log")" -eq 0 ] && [ "${frames:-0}" -gt 0 ]
 }
 
 echo "=== raptor-test: $URL ==="
@@ -288,12 +314,17 @@ fi
 # hold one exact cadence (a bang-banging steering loop splits the modal
 # share across cadence±nudge and file muxers drop packets around it)
 if [ -n "$TSRPT" ]; then
-    if echo "$TSRPT" | grep -qE 'backward=0.*backward=0'; then
+    # A video-only stream prints no audio backward=/spikes= fields
+    # ("too few"), so require the token once per MEASURED track --
+    # a loose single-token match would vacuously pass broken audio.
+    TSNEED=2
+    echo "$TSRPT" | grep -q '(too few)' && TSNEED=1
+    if [ "$(echo "$TSRPT" | grep -oE 'backward=0' | wc -l)" -ge "$TSNEED" ]; then
         ok "RTP timestamps never step backward (wire)"
     else
         bad "RTP timestamps step backward on the wire" "$TSRPT"
     fi
-    if echo "$TSRPT" | grep -qE 'spikes=0.*spikes=0'; then
+    if [ "$(echo "$TSRPT" | grep -oE 'spikes=0' | wc -l)" -ge "$TSNEED" ]; then
         ok "no RTP timestamp spikes (wire)"
     else
         bad "RTP timestamp spike on the wire" "$TSRPT"
@@ -652,9 +683,12 @@ mpv_check() {
         "$turl" >"$WORK/$name.log" 2>&1
     local errs
     errs=$(tr '\r' '\n' <"$WORK/$name.log" | grep -ciE "$ERRPAT")
-    local av
+    local av opened
     av=$(tr '\r' '\n' <"$WORK/$name.log" | grep -oE 'A-V: *-?[0-9.]+' | tail -1 | grep -oE '[-0-9.]+$')
-    if [ "$errs" -gt 0 ]; then
+    opened=$(tr '\r' '\n' <"$WORK/$name.log" | grep -cE '^ *\(\+\) Video|^VO: ')
+    if [ "$errs" -eq 0 ] && [ "$opened" -eq 0 ]; then
+        bad "$name" "no video track opened (vacuous run)"
+    elif [ "$errs" -gt 0 ]; then
         bad "$name" "see below"
         tr '\r' '\n' <"$WORK/$name.log" | grep -iE "$ERRPAT" | sort | uniq -c | sort -rn | head -3 | sed 's/^/          /'
     elif [ -n "$av" ] && ! python3 -c "import sys; sys.exit(0 if abs(float('$av')) < 0.1 else 1)"; then
