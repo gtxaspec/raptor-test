@@ -125,6 +125,12 @@ class RtspSession:
         """SETUP target for a media type, from the parsed a=control."""
         return getattr(self, "tracks", {}).get(media, self.url + "/" + media)
 
+    def first_media(self):
+        """Preferred media for single-track probes: video when the
+        source has it, else audio (audio-only sources)."""
+        t = getattr(self, "tracks", {})
+        return "video" if "video" in t else ("audio" if "audio" in t else "video")
+
     def setup(self, media, ch):
         return self.request(
             "SETUP", self.track_url(media),

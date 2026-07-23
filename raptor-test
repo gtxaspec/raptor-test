@@ -37,6 +37,9 @@ Options:
   --rtmp <port>        listen for rsp's RTMP push on this port
   --webrtc <whip-url>  WebRTC leg via rwd WHIP (H264 stream; needs webrtc-venv)
   --gop <frames>       assert the measured GOP interval equals this value
+  --soak <minutes>     endurance mode: repeated bounded captures with
+                       device RSS/FD trending (needs --ssh for trends);
+                       replaces the normal battery
   --keep-logs          keep the log directory even on success
   -h, --help           this text
 
@@ -69,6 +72,7 @@ TLS_URL=""
 RTMP_PORT=""
 WEBRTC_URL=""
 GOP_EXPECT=""
+SOAK_MIN=""
 while [ $# -gt 0 ]; do
     case "$1" in
     --sub) SUB_URL=$2; shift 2 ;;
@@ -78,6 +82,7 @@ while [ $# -gt 0 ]; do
     --frigate) FRIGATE=1; shift ;;
     --record-check) RECDIR=$2; shift 2 ;;
     --gop) GOP_EXPECT=$2; shift 2 ;;
+    --soak) SOAK_MIN=$2; shift 2 ;;
     --keep-logs) KEEP=1; shift ;;
     --user) RTSP_USER=$2; shift 2 ;;
     --pass) RTSP_PASS=$2; shift 2 ;;
@@ -174,6 +179,18 @@ ERRPAT='missed|dropping|discontinuity|corrupt|concealing|invalid data|error whil
 
 ok() { echo "  PASS  $1"; PASS=$((PASS + 1)); }
 skip() { echo "  SKIP  $1"; SKIP=$((SKIP + 1)); }
+
+print_result() {
+    echo ""
+    echo "=== RESULT: $PASS passed, $FAIL failed, $SKIP skipped ==="
+    if [ "$FAIL" -gt 0 ]; then
+        printf '  failed: %s\n' "${FAILED_NAMES[@]}"
+        echo "  logs kept in: $WORK"
+        exit 1
+    fi
+    [ "$KEEP" = 1 ] && echo "  logs kept in: $WORK"
+    exit 0
+}
 bad() {
     echo "  FAIL  $1${2:+ — $2}"
     FAIL=$((FAIL + 1))
@@ -209,11 +226,17 @@ capture() {
     [ -n "$transport" ] && targ=(-rtsp_transport "$transport")
     timeout -k 5 $((secs + 14)) "$FFMPEG" -nostdin -v warning "${targ[@]}" -i "$url" \
         -t "$secs" -progress "$WORK/$name.progress" -f null - >"$WORK/$name.log" 2>&1
-    # zero error lines AND real decoded video: a client that exits 0
-    # without ever producing frames (bad URL, own help text) must FAIL
-    local frames
-    frames=$(sed -n 's/^frame=//p' "$WORK/$name.progress" 2>/dev/null | tail -1)
-    [ "$(grep -ciE "$ERRPAT" "$WORK/$name.log")" -eq 0 ] && [ "${frames:-0}" -gt 0 ]
+    # zero error lines AND real decoded media: a client that exits 0
+    # without ever producing output (bad URL, own help text) must FAIL
+    if [ "${AUDIO_ONLY:-0}" = 1 ]; then
+        local ot
+        ot=$(sed -n 's/^out_time_us=//p' "$WORK/$name.progress" 2>/dev/null | tail -1)
+        [ "$(grep -ciE "$ERRPAT" "$WORK/$name.log")" -eq 0 ] && [ "${ot:-0}" -gt 500000 ]
+    else
+        local frames
+        frames=$(sed -n 's/^frame=//p' "$WORK/$name.progress" 2>/dev/null | tail -1)
+        [ "$(grep -ciE "$ERRPAT" "$WORK/$name.log")" -eq 0 ] && [ "${frames:-0}" -gt 0 ]
+    fi
 }
 
 echo "=== raptor-test: $URL ==="
@@ -234,7 +257,15 @@ print(sdp)
 EOF
 )
 echo "$SDP" >"$WORK/sdp.txt"
-if echo "$SDP" | grep -q 'm=video'; then ok "SDP: video track present"; else bad "SDP: video track present"; fi
+AUDIO_ONLY=0
+if echo "$SDP" | grep -q 'm=video'; then
+    ok "SDP: video track present"
+elif echo "$SDP" | grep -q 'm=audio'; then
+    AUDIO_ONLY=1
+    ok "SDP: audio-only source (video checks self-skip)"
+else
+    bad "SDP: no media tracks advertised"
+fi
 
 # ── 1b. Auth battery (--user/--pass): the machinery must challenge,
 # reject, accept, and enforce ──
@@ -299,6 +330,64 @@ EOF
     then ok "SDP: AAC config= consistent with clock ($CONFIG @ ${ACLK}Hz)"; else bad "SDP: AAC config= vs clock" "$CONFIG @ $ACLK"; fi
 else
     skip "SDP AAC checks (no mpeg4-generic audio advertised)"
+fi
+
+# ── 1b. Soak mode (--soak): endurance instead of the battery ──
+if [ -n "$SOAK_MIN" ]; then
+    DEADLINE=$(( $(date +%s) + SOAK_MIN * 60 ))
+    CYCLE=0
+    SOAK_FAILS=0
+    rss_of() { ssh -o ConnectTimeout=6 "$SSH_TARGET" "awk '/VmRSS/{print \$2}' /proc/\$(pidof $1)/status 2>/dev/null" 2>/dev/null; }
+    fds_of() { ssh -o ConnectTimeout=6 "$SSH_TARGET" "ls /proc/\$(pidof $1)/fd 2>/dev/null | wc -l" 2>/dev/null; }
+    if [ -n "$SSH_TARGET" ]; then
+        RVD_RSS0=$(rss_of rvd); RSD_RSS0=$(rss_of rsd)
+        RVD_FD0=$(fds_of rvd);  RSD_FD0=$(fds_of rsd)
+        echo "    soak baseline: rvd rss=${RVD_RSS0:-?}kB fd=${RVD_FD0:-?} | rsd rss=${RSD_RSS0:-?}kB fd=${RSD_FD0:-?}"
+    fi
+    while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+        CYCLE=$((CYCLE + 1))
+        T=$([ $((CYCLE % 2)) -eq 0 ] && echo "" || echo tcp)
+        if capture "soak_$CYCLE" 30 "$URL" $T; then
+            :
+        else
+            SOAK_FAILS=$((SOAK_FAILS + 1))
+            echo "    cycle $CYCLE (${T:-udp}): capture FAILED"
+        fi
+        rm -f "$WORK/soak_$CYCLE".*
+    done
+    if [ "$SOAK_FAILS" -eq 0 ]; then
+        ok "soak: $CYCLE bounded captures clean over ${SOAK_MIN}m"
+    else
+        bad "soak captures" "$SOAK_FAILS of $CYCLE cycles failed"
+    fi
+    if [ -n "$SSH_TARGET" ]; then
+        RVD_RSS1=$(rss_of rvd); RSD_RSS1=$(rss_of rsd)
+        RVD_FD1=$(fds_of rvd);  RSD_FD1=$(fds_of rsd)
+        echo "    soak end: rvd rss=${RVD_RSS1:-?}kB fd=${RVD_FD1:-?} | rsd rss=${RSD_RSS1:-?}kB fd=${RSD_FD1:-?}"
+        for d in RVD RSD; do
+            R0=$(eval echo \$${d}_RSS0); R1=$(eval echo \$${d}_RSS1)
+            F0=$(eval echo \$${d}_FD0);  F1=$(eval echo \$${d}_FD1)
+            if [ -n "$R0" ] && [ -n "$R1" ] && [ "$R0" -gt 0 ] 2>/dev/null; then
+                if [ $((R1 * 100)) -le $((R0 * 125)) ]; then
+                    ok "soak: $d RSS stable (${R0}kB -> ${R1}kB)"
+                else
+                    bad "soak $d RSS growth" "${R0}kB -> ${R1}kB (>25%)"
+                fi
+            else
+                skip "soak $d RSS trend (daemon not found)"
+            fi
+            if [ -n "$F0" ] && [ -n "$F1" ] && [ "$F1" -le $((F0 + 3)) ] 2>/dev/null; then
+                ok "soak: $d FDs stable ($F0 -> $F1)"
+            elif [ -n "$F0" ] && [ -n "$F1" ]; then
+                bad "soak $d FD growth" "$F0 -> $F1"
+            else
+                skip "soak $d FD trend (daemon not found)"
+            fi
+        done
+    else
+        skip "soak device trends (--ssh not given)"
+    fi
+    print_result
 fi
 
 # ── 2. Transport matrix ──
@@ -425,6 +514,8 @@ sys.exit(0 if (mono_v and mono_a and abs(end_off) < 500) else 1)
 EOF
 )
     if [ $? -eq 0 ]; then ok "A/V capture timestamps ($TSRES)"; else bad "A/V capture timestamps" "$TSRES"; fi
+elif [ "$AUDIO_ONLY" = 1 ]; then
+    skip "A/V capture timestamps (audio-only source)"
 else
     bad "A/V capture timestamps" "capture produced only $VP video packets"
 fi
@@ -753,7 +844,9 @@ mpv_check() {
     errs=$(tr '\r' '\n' <"$WORK/$name.log" | grep -ciE "$ERRPAT")
     local av opened
     av=$(tr '\r' '\n' <"$WORK/$name.log" | grep -oE 'A-V: *-?[0-9.]+' | tail -1 | grep -oE '[-0-9.]+$')
-    opened=$(tr '\r' '\n' <"$WORK/$name.log" | grep -cE '^ *\(\+\) Video|^VO: ')
+    local openpat='^ *\(\+\) Video|^VO: '
+    [ "${AUDIO_ONLY:-0}" = 1 ] && openpat='^ *\(\+\) Audio|^AO: '
+    opened=$(tr '\r' '\n' <"$WORK/$name.log" | grep -cE "$openpat")
     if [ "$errs" -eq 0 ] && [ "$opened" -eq 0 ]; then
         bad "$name" "no video track opened (vacuous run)"
     elif [ "$errs" -gt 0 ]; then
@@ -776,7 +869,9 @@ fi
 # ffmpeg and mpv share libav's RTSP; live555 negotiates and consumes
 # sessions differently, so it exercises server paths they cannot.
 ORTSP="$DIR/tools/openRTSP"
-if [ -x "$ORTSP" ]; then
+if [ "$AUDIO_ONLY" = 1 ]; then
+    skip "openRTSP dump (audio-only source)"
+elif [ -x "$ORTSP" ]; then
     ODIR="$WORK/ortsp"
     mkdir -p "$ODIR"
     (cd "$ODIR" && timeout -k 5 25 "$ORTSP" -t -d 8 -V -F s "$URL") \
@@ -1252,12 +1347,4 @@ else
     skip "external recording check (--record-check not given)"
 fi
 
-echo ""
-echo "=== RESULT: $PASS passed, $FAIL failed, $SKIP skipped ==="
-if [ "$FAIL" -gt 0 ]; then
-    printf '  failed: %s\n' "${FAILED_NAMES[@]}"
-    echo "  logs kept in: $WORK"
-    exit 1
-fi
-[ "$KEEP" = 1 ] && echo "  logs kept in: $WORK"
-exit 0
+print_result

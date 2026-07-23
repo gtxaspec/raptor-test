@@ -94,7 +94,11 @@ oline = next((l for l in sdp.splitlines() if l.startswith("o=")), "")
 of = oline.split()
 o_ok = len(of) >= 6 and of[1] != "0" and of[5] != "0.0.0.0"
 emit(o_ok, "RFC4566 o= has session id and real address", oline)
-emit(any(l.startswith("m=video") for l in sdp.splitlines()), "RFC4566 video media section", "")
+if any(l.startswith("m=video") for l in sdp.splitlines()):
+    emit(True, "RFC4566 video media section", "")
+else:
+    emit(any(l.startswith("m=audio") for l in sdp.splitlines()),
+         "RFC4566 media section present (audio-only source)", "")
 has_audio = any(l.startswith("m=audio") for l in sdp.splitlines())
 controls = sum(1 for l in sdp.splitlines() if l.startswith("a=control:"))
 emit(controls >= 1, "RFC4566 a=control present", f"{controls} entries")
@@ -149,17 +153,20 @@ for line in sdp.splitlines():
         track_url[cur] = c if c.startswith("rtsp://") else url.rstrip("/") + "/" + c
 vurl = track_url.get("video", url + "/video")
 aurl = track_url.get("audio", url + "/audio")
+# Audio-only sources have no video track: SETUP the audio track on
+# the primary interleaved pair instead.
+primary_url = vurl if "video" in track_url or not track_url else aurl
 
 # -- SETUP both tracks, PLAY, RTP-Info --
 sess = None
-head, _, _ = req("SETUP", vurl, "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n")
+head, _, _ = req("SETUP", primary_url, "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n")
 for l in head.split("\r\n"):
     if l.lower().startswith("session"):
         sess = l.split(":")[1].split(";")[0].strip()
 emit(sess is not None, "RFC2326 SETUP returns Session", head.split("\r\n")[0])
 if not sess:
     sys.exit(0)
-if has_audio:
+if has_audio and primary_url != aurl:
     req("SETUP", aurl, f"Transport: RTP/AVP/TCP;unicast;interleaved=2-3\r\nSession: {sess}\r\n")
 head, _, leftover = req("PLAY", url, f"Session: {sess}\r\nRange: npt=0.000-\r\n")
 rtpinfo = {}

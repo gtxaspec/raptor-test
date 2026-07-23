@@ -111,6 +111,9 @@ listed, logs kept), 2 = usage error.
 | Frigate | Dockerized Frigate records via TCP and UDP inputs; recorded clips verified |
 | RHD HTTP | (`--rhd`) `/snap` returns a decodable JPEG of sane size (and refuses unauthenticated access when credentials are set); `/mjpeg` is `multipart/x-mixed-replace` carrying multiple JPEG parts that decode frame-by-frame with no errors |
 | RHD /audio | (`--rhd`) the HTTP audio stream (ADTS AAC, Ogg/Opus, or WAV/PCM, de-chunked) is framed correctly and decodes to PCM |
+| Audio-only | Auto-detected from the SDP (m=audio, no m=video): video checks self-skip, clean-media asserts decoded time instead of frames, single-track probes SETUP the audio track, and the full transport/wire/session/RFC battery runs (validated against a live555 WAV source) |
+| Soak | (`--soak <minutes>`) endurance mode replacing the battery: repeated bounded captures plus device RSS/FD trending over the run (fails on >25% RSS growth or >3 new FDs in rvd/rsd) |
+| WebRTC talk-back | The WHIP offer carries a sendrecv audio track (aiortc silence); the answer direction must accept client audio and, with `--ssh`, the decoded audio must land in the device speaker ring mid-session |
 | SRT | (`--srt`) connects as a caller to the SRT listener (rsr), confirms the MPEG-TS carries video, decodes the video clean, and decodes the audio all the way to PCM — the last step catches an ADTS sample-rate mislabel that a container probe would miss |
 | Codec matrix | `tools/codec-matrix.sh` sweeps l16/pcmu/pcma/opus/aac against **both** RTSP backends per codec, asserting the audio RTP timestamp step equals the codec's real frame duration (a server timestamping AAC at its 20ms chunk rate decodes fine but runs the clock 3x fast) |
 | Clips | Recorded files: streams present, durations aligned, full decode with zero errors (null-muxer dts nag and its repeat-tails excluded; file-level dts asserted to never move backward instead) |
@@ -166,8 +169,14 @@ with exact wire cadence (G.711 modal 160, opus modal 960 at 100%).
 
 ## Not covered (yet)
 
-WebRTC talk-back validation (the probe offers a sendrecv audio
-track; judging the far end needs a live rwd), audio-only RTSP
-sources, and multi-hour soak runs (a `--soak` mode with RSS/FD
-trending is the natural shape). The raptor provenance suite
-separately covers snapshots, EXIF, signing, and rverify chains.
+Multi-day soak (the `--soak` mode trends RSS/FDs over minutes to
+hours, not days) and content verification of talk-back audio at the
+far end (the suite proves arrival in the speaker ring, not what rad
+plays out). The raptor provenance suite separately covers snapshots,
+EXIF, signing, and rverify chains.
+
+To self-test the audio-only mode without a camera: build
+`live555MediaServer` (same source fetch-tools uses for openRTSP),
+serve a **plain** WAV from its working directory (python's `wave`
+module output works; ffmpeg's WAV writer adds metadata chunks live555
+rejects), and point the suite at `rtsp://host:8554/<file>.wav`.
