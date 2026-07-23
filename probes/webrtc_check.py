@@ -28,6 +28,7 @@ user = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
 password = sys.argv[3] if len(sys.argv) > 3 else None
 duration = float(sys.argv[4]) if len(sys.argv) > 4 else 10.0
 nominal_fps = float(sys.argv[5]) if len(sys.argv) > 5 else 0.0
+talkback = len(sys.argv) > 6 and sys.argv[6] == "1"
 
 results = []
 
@@ -39,9 +40,15 @@ def emit(okay, name, detail=""):
 
 async def run():
     pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
-    # Receive-only: ask for both media types.
     pc.addTransceiver("video", direction="recvonly")
-    pc.addTransceiver("audio", direction="recvonly")
+    if talkback:
+        # Talk-back: offer to SEND audio too. aiortc's stock
+        # AudioStreamTrack generates 20ms silence frames, which is
+        # enough to exercise rwd's receive path (Compy_AudioReceiver).
+        from aiortc.mediastreams import AudioStreamTrack
+        pc.addTransceiver(AudioStreamTrack(), direction="sendrecv")
+    else:
+        pc.addTransceiver("audio", direction="recvonly")
 
     v_arrivals = []   # wall-clock arrival per video frame
     v_pts = []        # frame PTS (RTP timebase)
@@ -97,6 +104,24 @@ async def run():
     emit("a=fingerprint" in answer_sdp and "a=ice-ufrag" in answer_sdp,
          "WebRTC WHIP: SDP answer has DTLS fingerprint + ICE",
          f"{resp.status}, {len(answer_sdp)}B")
+
+    if talkback:
+        # The answer's audio direction tells us whether the server
+        # actually accepted client audio.
+        a_dir = "none"
+        in_a = False
+        for line in answer_sdp.splitlines():
+            if line.startswith("m=audio"):
+                in_a = True
+            elif line.startswith("m=") :
+                in_a = False
+            elif in_a and line.startswith("a=") and line.strip() in (
+                    "a=sendrecv", "a=recvonly", "a=sendonly", "a=inactive"):
+                a_dir = line.strip()[2:]
+                break
+        emit(a_dir in ("sendrecv", "recvonly"),
+             "WebRTC talk-back negotiated (server accepts client audio)",
+             f"answer audio direction: {a_dir}")
 
     await pc.setRemoteDescription(RTCSessionDescription(sdp=answer_sdp, type="answer"))
 

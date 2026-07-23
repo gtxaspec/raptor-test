@@ -79,7 +79,7 @@ battery_for_target() {
     SOC=''; HOST=''; SSH=''; SRT=''; RHD=''; USER=''; PASS=''
     RTSP_PORT=554; PATH0=stream0; PATH1=stream1
     R555_PORT=''; R555_PATH0=stream0; R555_PATH1=stream1
-    GO2RTC=''; FRIGATE=no; RECORD_CHECK=''; NOTES=''
+    GO2RTC=''; FRIGATE=no; RECORD_CHECK=''; NOTES=''; GOP=''
     TLS=''; RTMP=''; WEBRTC=''
     # A syntax error (e.g. unquoted parens in NOTES) makes bash abort
     # sourcing mid-file, silently dropping every field after the bad
@@ -105,6 +105,7 @@ battery_for_target() {
     [ -n "$GO2RTC" ]       && common+=(--go2rtc "$GO2RTC")
     [ "$FRIGATE" = yes ]   && common+=(--frigate)
     [ -n "$RECORD_CHECK" ] && common+=(--record-check "$RECORD_CHECK")
+    [ -n "$GOP" ] && common+=(--gop "$GOP")
     [ -n "$RHD" ]          && common+=(--rhd "$RHD")
 
     # Backend 1: rsd (compy) — also carries the backend-independent

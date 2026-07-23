@@ -12,6 +12,7 @@ import sys
 path, codec = sys.argv[1], sys.argv[2]
 data = open(path, "rb").read()
 vcl = idr = sei = sps = 0
+idr_marks = []
 i = 0
 n = len(data)
 while True:
@@ -23,6 +24,7 @@ while True:
         t = (b0 >> 1) & 0x3F
         if t in (19, 20, 21):
             idr += 1
+            idr_marks.append(vcl)
             vcl += 1
         elif t <= 31:
             vcl += 1
@@ -34,6 +36,7 @@ while True:
         t = b0 & 0x1F
         if t == 5:
             idr += 1
+            idr_marks.append(vcl)
             vcl += 1
         elif 1 <= t <= 4:
             vcl += 1
@@ -42,4 +45,11 @@ while True:
         elif t == 7:
             sps += 1
     i += 3
-print(f"codec={codec} vcl={vcl} idr={idr} sei={sei} sps={sps}")
+ints = [b - a for a, b in zip(idr_marks, idr_marks[1:])]
+extra = ""
+if ints:
+    from collections import Counter
+    modal = Counter(ints).most_common(1)[0][0]
+    dev = max(abs(x - modal) for x in ints)
+    extra = f" gopint={modal} gopdev={dev} gopn={len(ints)}"
+print(f"codec={codec} vcl={vcl} idr={idr} sei={sei} sps={sps}{extra}")

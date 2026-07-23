@@ -36,6 +36,7 @@ Options:
   --tls <rtsps-url>    RTSPS/TLS leg (server needs [rtsp] tls=true)
   --rtmp <port>        listen for rsp's RTMP push on this port
   --webrtc <whip-url>  WebRTC leg via rwd WHIP (H264 stream; needs webrtc-venv)
+  --gop <frames>       assert the measured GOP interval equals this value
   --keep-logs          keep the log directory even on success
   -h, --help           this text
 
@@ -67,6 +68,7 @@ SRT_URL=""
 TLS_URL=""
 RTMP_PORT=""
 WEBRTC_URL=""
+GOP_EXPECT=""
 while [ $# -gt 0 ]; do
     case "$1" in
     --sub) SUB_URL=$2; shift 2 ;;
@@ -75,6 +77,7 @@ while [ $# -gt 0 ]; do
     --go2rtc) GO2RTC=$2; shift 2 ;;
     --frigate) FRIGATE=1; shift ;;
     --record-check) RECDIR=$2; shift 2 ;;
+    --gop) GOP_EXPECT=$2; shift 2 ;;
     --keep-logs) KEEP=1; shift ;;
     --user) RTSP_USER=$2; shift 2 ;;
     --pass) RTSP_PASS=$2; shift 2 ;;
@@ -147,6 +150,12 @@ if [ -n "$SSH_TARGET" ]; then
     EXTERNAL_SESSIONS=${EXTERNAL_SESSIONS:-0}
     [ "$EXTERNAL_SESSIONS" -gt 0 ] && \
         echo "    note: $EXTERNAL_SESSIONS pre-existing RTSP session(s) on the target"
+    # Baselines for the post-suite health checks: device log position
+    # (only lines emitted DURING the run are judged) and device-side
+    # framesource drop counters ("losted buffers" in isp-fs).
+    LOG_BASE=$(ssh -o ConnectTimeout=8 "$SSH_TARGET" 'logread 2>/dev/null | wc -l' 2>/dev/null)
+    DROP_BASE=$(ssh -o ConnectTimeout=8 "$SSH_TARGET" \
+        'test -f /proc/jz/isp/isp-fs && grep -i "lost" /proc/jz/isp/isp-fs | awk "{s+=\$NF} END{print s+0}" || echo NA' 2>/dev/null)
 fi
 WORK="./raptor-test-logs/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$WORK"
@@ -506,6 +515,28 @@ if [ -n "$RAWFMT" ]; then
     else
         bad "per-frame SEI coverage" "$SEIN of $VCLN frames"
     fi
+    # GOP adherence: keyframes must be strictly periodic (a drifting
+    # or elastic GOP breaks recorder segmenting and joiner latency);
+    # with --gop the modal interval must equal the configured value.
+    GOPI=$(echo "$CENSUS" | grep -o 'gopint=[0-9]*' | cut -d= -f2)
+    GOPD=$(echo "$CENSUS" | grep -o 'gopdev=[0-9]*' | cut -d= -f2)
+    GOPN=$(echo "$CENSUS" | grep -o 'gopn=[0-9]*' | cut -d= -f2)
+    if [ "${GOPN:-0}" -ge 2 ]; then
+        if [ "${GOPD:-99}" -le 1 ]; then
+            ok "GOP interval regular (${GOPI} frames, maxdev ${GOPD}, ${GOPN} intervals)"
+        else
+            bad "GOP interval regularity" "modal=${GOPI} maxdev=${GOPD} over ${GOPN} intervals"
+        fi
+        if [ -n "$GOP_EXPECT" ]; then
+            if [ "${GOPI:-0}" -eq "$GOP_EXPECT" ]; then
+                ok "GOP interval matches configured ($GOP_EXPECT frames)"
+            else
+                bad "GOP interval vs configured" "measured ${GOPI}, configured $GOP_EXPECT"
+            fi
+        fi
+    else
+        skip "GOP interval regularity (fewer than 3 keyframes in the window)"
+    fi
 fi
 
 # ── 4d. RFC conformance (RFC 2326 / 4566 / 3550 / 3640) ──
@@ -650,6 +681,43 @@ if [ -n "$SSH_TARGET" ]; then
         ok "no leaked TCP connections (baseline $EXTERNAL_SESSIONS external, now ${NCONN:-0})"
     else
         bad "leaked TCP connections" "baseline ${EXTERNAL_SESSIONS:-0}, now ${NCONN:-?}"
+    fi
+    # Daemon log lines emitted during the run must be error-clean.
+    # WARN-level noise from our own abuse checks (bogus paths, garbage
+    # transports) is expected; ERROR-level lines and crashes are not.
+    if [ -n "${LOG_BASE:-}" ]; then
+        LOG_NOW=$(ssh -o ConnectTimeout=8 "$SSH_TARGET" 'logread 2>/dev/null | wc -l' 2>/dev/null)
+        if [ -n "$LOG_NOW" ] && [ "$LOG_NOW" -ge "$LOG_BASE" ]; then
+            NEWLOG=$(ssh -o ConnectTimeout=8 "$SSH_TARGET" \
+                "logread 2>/dev/null | tail -n +$((LOG_BASE + 1))" 2>/dev/null \
+                | grep -E '(rvd|rsd|rad|rod|ric|rhd|rwd|rsp|rsr|rmr)(\[|:| )')
+            DLINES=$(echo "$NEWLOG" | grep -c .)
+            DERRS=$(echo "$NEWLOG" | grep -ciE 'daemon\.err|\[ERROR\]|segfault|assert|oops|fatal')
+            if [ "${DERRS:-0}" -eq 0 ]; then
+                ok "device daemon logs error-free during run ($DLINES lines)"
+            else
+                bad "device daemon log errors during run" "$DERRS error line(s)"
+                echo "$NEWLOG" | grep -iE 'daemon\.err|\[ERROR\]|segfault|assert|oops|fatal' \
+                    | head -3 | sed 's/^/          /'
+            fi
+        else
+            skip "device log sweep (log ring wrapped during run)"
+        fi
+    fi
+    # Device-side framesource drops: the "losted buffers" counters
+    # must not grow while the suite streams.
+    if [ -n "${DROP_BASE:-}" ] && [ "$DROP_BASE" != "NA" ]; then
+        DROP_NOW=$(ssh -o ConnectTimeout=8 "$SSH_TARGET" \
+            'test -f /proc/jz/isp/isp-fs && grep -i "lost" /proc/jz/isp/isp-fs | awk "{s+=\$NF} END{print s+0}" || echo NA' 2>/dev/null)
+        if [ -z "$DROP_NOW" ] || [ "$DROP_NOW" = "NA" ]; then
+            skip "device frame-drop counters (isp-fs unreadable post-run)"
+        elif [ "$((DROP_NOW - DROP_BASE))" -eq 0 ]; then
+            ok "no device-side dropped frames (losted counters flat at $DROP_NOW)"
+        else
+            bad "device-side dropped frames" "losted counters $DROP_BASE -> $DROP_NOW"
+        fi
+    elif [ -n "${DROP_BASE:-}" ]; then
+        skip "device frame-drop counters (no isp-fs node on this SoC)"
     fi
     # IPv6 leg: dual-stack listeners have had v4/v6 path differences;
     # production NVRs commonly attach over v6.
@@ -817,6 +885,71 @@ if [ -n "$RHD_URL" ]; then
             bad "RHD /audio decode" "${RHDA:-0} PCM bytes, see $WORK/rhd_audio_decode.log"
             show_errs "$WORK/rhd_audio_decode.log"
         fi
+    fi
+fi
+
+# ── 8d. ONVIF backchannel: client -> server audio (auto-detected) ──
+# rsd advertises an a=sendonly audio section when [rtsp] backchannel
+# is enabled; the probe DESCRIBEs with the ONVIF Require header and,
+# if the track is there, pushes real RTP audio at the server.
+BCOUT=$(timeout -k 3 40 python3 "$PROBES/backchannel.py" "$HOST" "$PORT" "$RPATH" \
+    "${RTSP_USER:-}" "${RTSP_PASS:-}" 2>"$WORK/backchannel.err")
+echo "$BCOUT" >"$WORK/backchannel.txt"
+if ! echo "$BCOUT" | grep -q 'BC_DESCRIBE=200'; then
+    skip "backchannel (DESCRIBE with ONVIF Require not accepted)"
+elif ! echo "$BCOUT" | grep -q 'BC_SENDONLY=yes'; then
+    skip "backchannel (no sendonly track — [rtsp] backchannel off or non-raptor server)"
+else
+    BCCODEC=$(echo "$BCOUT" | grep -o 'BC_CODEC=.*' | cut -d= -f2)
+    ok "backchannel advertised (sendonly track, $BCCODEC)"
+    BCSENT=$(echo "$BCOUT" | grep -o 'BC_SENT=[0-9]*' | cut -d= -f2)
+    BCALIVE=$(echo "$BCOUT" | grep -o 'BC_ALIVE=.*' | cut -d= -f2)
+    if [ "${BCSENT:-0}" -ge 30 ] && [ "$BCALIVE" = "yes" ]; then
+        ok "backchannel accepts client audio ($BCSENT RTP frames, session healthy after)"
+    else
+        bad "backchannel audio send" "sent=${BCSENT:-0} alive=${BCALIVE:-none} (see backchannel.txt)"
+    fi
+    if [ -n "$SSH_TARGET" ]; then
+        if ssh -o ConnectTimeout=8 "$SSH_TARGET" 'test -e /dev/shm/rss_ring_speaker' 2>/dev/null; then
+            ok "speaker ring created on device (backchannel audio landed)"
+        else
+            bad "speaker ring on device" "/dev/shm/rss_ring_speaker missing after backchannel audio"
+        fi
+    fi
+fi
+
+# ── 8e. MJPEG over RTSP: the /jpeg endpoint (auto-detected) ──
+# Ring names (jpeg0/jpeg1) are not URL paths: rsd default endpoints
+# for the jpeg streams are /jpeg and /jpeg_sub.
+JURL="${URL%"$RPATH"}/jpeg"
+JSTAT=$(python3 - "$PROBES" "$HOST" "$PORT" "/jpeg" "${RTSP_USER:-}" "${RTSP_PASS:-}" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+from rtsplib import RtspSession
+user = sys.argv[5] or None
+try:
+    s = RtspSession(sys.argv[2], sys.argv[3], sys.argv[4], user=user, password=sys.argv[6])
+    status, _ = s.describe()
+    print(status.split(" ")[1] if len(status.split(" ")) > 1 else "none")
+    s.close()
+except Exception:
+    print("none")
+EOF
+)
+if [ "$JSTAT" != "200" ]; then
+    skip "MJPEG over RTSP (/jpeg not served — [rtsp] jpeg off or non-raptor server)"
+else
+    if capture jpeg0 8 "$JURL" tcp; then
+        JCODEC=$("$FFPROBE" -v error -rtsp_transport tcp -select_streams v \
+            -show_entries stream=codec_name -of csv=p=0 "$JURL" 2>/dev/null | head -1)
+        if [ "$JCODEC" = "mjpeg" ]; then
+            ok "MJPEG over RTSP: /jpeg decodes clean (codec=mjpeg)"
+        else
+            bad "MJPEG over RTSP codec" "expected mjpeg, ffprobe says '${JCODEC:-none}'"
+        fi
+    else
+        bad "MJPEG over RTSP" "see below"
+        show_errs "$WORK/jpeg0.log"
     fi
 fi
 
@@ -1005,7 +1138,7 @@ if [ -n "$WEBRTC_URL" ]; then
     WVENV="$DIR/tools/webrtc-venv/bin/python"
     if [ -x "$WVENV" ]; then
         WRTC=$(timeout -k 5 45 "$WVENV" "$PROBES/webrtc_check.py" "$WEBRTC_URL" \
-            "${RTSP_USER:-}" "${RTSP_PASS:-}" 12 0 2>&1)
+            "${RTSP_USER:-}" "${RTSP_PASS:-}" 12 0 1 2>&1)
         echo "$WRTC" >"$WORK/webrtc.txt"
         while IFS= read -r line; do
             case $line in
@@ -1014,6 +1147,15 @@ if [ -n "$WEBRTC_URL" ]; then
                 SKIP\ *) skip "${line#SKIP }" ;;
             esac
         done <<< "$WRTC"
+        # Talk-back evidence on the device: rwd writes received client
+        # audio into the speaker ring.
+        if [ -n "$SSH_TARGET" ] && echo "$WRTC" | grep -q "OK WebRTC talk-back"; then
+            if ssh -o ConnectTimeout=8 "$SSH_TARGET" 'test -e /dev/shm/rss_ring_speaker' 2>/dev/null; then
+                ok "WebRTC talk-back audio landed (speaker ring on device)"
+            else
+                bad "WebRTC talk-back device evidence" "/dev/shm/rss_ring_speaker missing"
+            fi
+        fi
     else
         skip "WebRTC leg (tools/webrtc-venv missing — run tools/fetch-tools.sh)"
     fi
