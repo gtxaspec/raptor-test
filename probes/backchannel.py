@@ -42,7 +42,7 @@ def main():
     if "200" not in status:
         return
     print(f"BC_SENDONLY={'yes' if 'a=sendonly' in sdp else 'no'}")
-    naud = sum(1 for l in sdp.splitlines() if l.startswith("m=audio"))
+    naud = sum(1 for ln in sdp.splitlines() if ln.startswith("m=audio"))
     print(f"BC_AUDIO_SECTIONS={naud}")
     if "a=sendonly" not in sdp:
         return

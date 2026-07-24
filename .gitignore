@@ -4,6 +4,7 @@ raptor-test-logs/
 tools/ffmpeg
 tools/ffprobe
 tools/openRTSP
+tools/live555MediaServer
 tools/webrtc-venv/
 .ruff_cache/
 # site target manifests stay local (lab IPs etc); the template is tracked

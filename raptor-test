@@ -19,6 +19,17 @@
 # kill only a timeout wrapper (orphaned ffmpeg streams forever).
 set -u
 
+# Run from a private copy: editing this file while a battery is live
+# corrupts the running interpreter's parse (bash reads incrementally).
+if [ -z "${RAPTOR_TEST_SELF:-}" ]; then
+    RAPTOR_TEST_HOME="$(cd "$(dirname "$0")" && pwd)"
+    export RAPTOR_TEST_HOME
+    RAPTOR_TEST_SELF=$(mktemp "${TMPDIR:-/tmp}/raptor-test-run.XXXXXX")
+    export RAPTOR_TEST_SELF
+    cp "$0" "$RAPTOR_TEST_SELF"
+    exec /bin/bash "$RAPTOR_TEST_SELF" "$@"
+fi
+
 usage() {
     cat <<'EOF'
 usage: raptor-test <rtsp-url> [options]
@@ -37,6 +48,9 @@ Options:
   --rtmp <port>        listen for rsp's RTMP push on this port
   --webrtc <whip-url>  WebRTC leg via rwd WHIP (H264 stream; needs webrtc-venv)
   --gop <frames>       assert the measured GOP interval equals this value
+  --core               fast core subset: signaling, transports, wire,
+                       content, RFC/robustness; skips sessions,
+                       concurrency, players and all legs (self-check)
   --soak <minutes>     endurance mode: repeated bounded captures with
                        device RSS/FD trending (needs --ssh for trends);
                        replaces the normal battery
@@ -73,6 +87,7 @@ RTMP_PORT=""
 WEBRTC_URL=""
 GOP_EXPECT=""
 SOAK_MIN=""
+CORE=0
 while [ $# -gt 0 ]; do
     case "$1" in
     --sub) SUB_URL=$2; shift 2 ;;
@@ -83,6 +98,7 @@ while [ $# -gt 0 ]; do
     --record-check) RECDIR=$2; shift 2 ;;
     --gop) GOP_EXPECT=$2; shift 2 ;;
     --soak) SOAK_MIN=$2; shift 2 ;;
+    --core) CORE=1; shift ;;
     --keep-logs) KEEP=1; shift ;;
     --user) RTSP_USER=$2; shift 2 ;;
     --pass) RTSP_PASS=$2; shift 2 ;;
@@ -119,7 +135,7 @@ if [ -n "$RTSP_USER" ]; then
     case "$SUB_URL" in *@*) : ;; *) SUB_URL="rtsp://$RTSP_USER:$RTSP_PASS@${SUB_URL#rtsp://}" ;; esac
 fi
 
-DIR="$(cd "$(dirname "$0")" && pwd)"
+DIR="${RAPTOR_TEST_HOME:-$(cd "$(dirname "$0")" && pwd)}"
 PROBES="$DIR/probes"
 # Client pinning: RTSP behavior shifts between ffmpeg majors (7.1
 # streamcopy silently drops RTSP AAC audio; 8.x fixed it). Prefer the
@@ -212,6 +228,7 @@ cleanup() {
     fi
     [ -n "$FRIGATE_DIR" ] && rm -rf "$FRIGATE_DIR"
     [ "$KEEP" = 0 ] && [ "$FAIL" = 0 ] && rm -rf "$WORK"
+    rm -f "${RAPTOR_TEST_SELF:-}"
 }
 trap cleanup EXIT
 
@@ -457,6 +474,9 @@ if [ -n "$MAXRTP" ]; then
 fi
 
 # ── 3b. Session lifecycle: silent-client reaping, transport re-SETUP ──
+if [ "$CORE" = 1 ]; then
+    skip "session lifecycle (core mode)"
+else
 SESSRPT=$(timeout 40 python3 "$PROBES/session_probe.py" switch "$HOST" "$PORT" "$RPATH" ${RTSP_USER:+"$RTSP_USER" "$RTSP_PASS"} 2>&1)
 echo "$SESSRPT" >"$WORK/switch.txt"
 while IFS= read -r line; do
@@ -475,6 +495,7 @@ while IFS= read -r line; do
         SKIP\ *) skip "${line#SKIP }" ;;
     esac
 done <<< "$REAPRPT"
+fi
 
 # ── 4. A/V timestamps in a real capture ──
 # -copyinkf: ffmpeg's streamcopy waits for a key-flagged packet per
@@ -638,6 +659,11 @@ while IFS= read -r line; do
     FAIL\ *) bad "${line#FAIL }" ;;
     esac
 done <"$WORK/rfc.txt"
+
+if [ "$CORE" = 1 ]; then
+    skip "concurrency/players/legs (core mode)"
+    print_result
+fi
 
 # ── 5a. Concurrency ladder: 2 -> 3 -> 4 simultaneous clients ──
 # concurrent_check <label> <url> <n> <secs>: n clients (alternating

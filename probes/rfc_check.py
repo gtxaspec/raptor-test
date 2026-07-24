@@ -83,38 +83,38 @@ def req(method, u, extra="", _retried=False):
 
 # -- RFC 2326: OPTIONS --
 head, _, _ = req("OPTIONS", url)
-public = next((l for l in head.split("\r\n") if l.lower().startswith("public")), "")
+public = next((ln for ln in head.split("\r\n") if ln.lower().startswith("public")), "")
 need = [m for m in ("DESCRIBE", "SETUP", "PLAY", "TEARDOWN") if m not in public]
 emit(not need, "RFC2326 OPTIONS Public lists core methods", public or "no Public header")
 
 # -- DESCRIBE + RFC 4566 SDP lints --
 head, sdp, _ = req("DESCRIBE", url, "Accept: application/sdp\r\n")
 emit("200" in head.split("\r\n")[0], "RFC2326 DESCRIBE 200", head.split("\r\n")[0])
-oline = next((l for l in sdp.splitlines() if l.startswith("o=")), "")
+oline = next((ln for ln in sdp.splitlines() if ln.startswith("o=")), "")
 of = oline.split()
 o_ok = len(of) >= 6 and of[1] != "0" and of[5] != "0.0.0.0"
 emit(o_ok, "RFC4566 o= has session id and real address", oline)
-if any(l.startswith("m=video") for l in sdp.splitlines()):
+if any(ln.startswith("m=video") for ln in sdp.splitlines()):
     emit(True, "RFC4566 video media section", "")
 else:
-    emit(any(l.startswith("m=audio") for l in sdp.splitlines()),
+    emit(any(ln.startswith("m=audio") for ln in sdp.splitlines()),
          "RFC4566 media section present (audio-only source)", "")
-has_audio = any(l.startswith("m=audio") for l in sdp.splitlines())
-controls = sum(1 for l in sdp.splitlines() if l.startswith("a=control:"))
+has_audio = any(ln.startswith("m=audio") for ln in sdp.splitlines())
+controls = sum(1 for ln in sdp.splitlines() if ln.startswith("a=control:"))
 emit(controls >= 1, "RFC4566 a=control present", f"{controls} entries")
 if "H265" in sdp or "H264" in sdp:
     emit("sprop" in sdp, "RFC6184/7798 sprop parameter sets in SDP", "")
 if "mpeg4-generic" in sdp.lower():
-    fmtp = next((l for l in sdp.splitlines() if "mpeg4-generic" not in l and "AAC-hbr" in l), "")
+    fmtp = next((ln for ln in sdp.splitlines() if "mpeg4-generic" not in ln and "AAC-hbr" in ln), "")
     needf = [k for k in ("sizelength=13", "indexlength=3", "indexdeltalength=3", "config=") if k not in fmtp]
     emit(not needf, "RFC3640 AAC-hbr fmtp complete", fmtp.strip() or "no fmtp")
 
 # -- Per-codec audio conformance (RFC 3551 static PTs, RFC 7587 Opus) --
-maudio = next((l for l in sdp.splitlines() if l.startswith("m=audio")), "")
+maudio = next((ln for ln in sdp.splitlines() if ln.startswith("m=audio")), "")
 if maudio:
     apt = maudio.split()[3] if len(maudio.split()) > 3 else ""
-    armap = next((l for l in sdp.splitlines()
-                  if l.startswith(f"a=rtpmap:{apt} ")), "")
+    armap = next((ln for ln in sdp.splitlines()
+                  if ln.startswith(f"a=rtpmap:{apt} ")), "")
     enc = armap.split(" ", 1)[1] if " " in armap else ""
     lo = enc.lower()
     if apt in ("0", "8") or lo.startswith("pcmu") or lo.startswith("pcma"):
@@ -160,9 +160,9 @@ primary_url = vurl if "video" in track_url or not track_url else aurl
 # -- SETUP both tracks, PLAY, RTP-Info --
 sess = None
 head, _, _ = req("SETUP", primary_url, "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n")
-for l in head.split("\r\n"):
-    if l.lower().startswith("session"):
-        sess = l.split(":")[1].split(";")[0].strip()
+for ln in head.split("\r\n"):
+    if ln.lower().startswith("session"):
+        sess = ln.split(":")[1].split(";")[0].strip()
 emit(sess is not None, "RFC2326 SETUP returns Session", head.split("\r\n")[0])
 if not sess:
     sys.exit(0)
@@ -175,9 +175,9 @@ rtpinfo = {}
 # tracks like track3 that must not be misfiled as video/audio).
 last_seg = {media: turl.rsplit("/", 1)[-1] for media, turl in
             {"video": vurl, "audio": aurl}.items()}
-for l in head.split("\r\n"):
-    if l.lower().startswith("rtp-info"):
-        for part in l.split(":", 1)[1].split(","):
+for ln in head.split("\r\n"):
+    if ln.lower().startswith("rtp-info"):
+        for part in ln.split(":", 1)[1].split(","):
             d = dict(kv.split("=", 1) for kv in part.strip().split(";") if "=" in kv)
             u = d.get("url", "").rstrip("/")
             key = next((m for m, seg in last_seg.items() if u.endswith("/" + seg)), None)
@@ -247,9 +247,9 @@ if srs[1]:
         aN, aR = srs[3][0][1], srs[3][0][2]
         vclk = 90000
         aclk = 48000
-        for l in sdp.splitlines():
-            if "mpeg4-generic/" in l.lower():
-                aclk = int(l.split("/")[1])
+        for ln in sdp.splitlines():
+            if "mpeg4-generic/" in ln.lower():
+                aclk = int(ln.split("/")[1])
         def s32(x):
             return x - 2**32 if x > 2**31 else x
         tv = vN + s32((rtpinfo["video"][1] - vR) & 0xFFFFFFFF) / vclk

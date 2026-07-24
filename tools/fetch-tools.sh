@@ -40,6 +40,12 @@ elif [ ! -x openRTSP ]; then
     (cd "$SRC/live" && sed -i 's/-DBSD=1/-DBSD=1 -std=c++20/' config.linux-64bit &&
         ./genMakefiles linux-64bit && make -j"$(nproc)") >/dev/null 2>&1
     cp "$SRC/live/testProgs/openRTSP" . && echo "built openRTSP"
+    # live555MediaServer: a real RFC-conformant RTSP server for the
+    # host-battery self-test (tools/host-battery.sh serves the test
+    # fixture through it so a green run means the suite passed against
+    # good media, no camera).
+    [ -x "$SRC/live/mediaServer/live555MediaServer" ] && \
+        cp "$SRC/live/mediaServer/live555MediaServer" . && echo "built live555MediaServer"
     rm -rf "$SRC"
 fi
 ./openRTSP 2>&1 | head -1 || true
