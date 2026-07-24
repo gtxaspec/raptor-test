@@ -644,14 +644,22 @@ EOF
 )
     if [ $? -eq 0 ]; then ok "audio decodes at declared rate ($SAMPRES)"; else bad "audio decoded sample count" "$SAMPRES"; fi
 
-    # Channel configuration: what the ASC declares vs what a decoder
-    # emits. One asymmetry is legitimate: ffmpeg presumes Parametric
-    # Stereo on ANY mono+SBR stream (aacdec: "Treating HE-AAC mono as
-    # stereo") and mirrors the one channel into two, so declared-mono
-    # HE-AAC decoding as 2ch passes ONLY if L and R carry the identical
-    # signal; distinct content would mean real stereo leaked into a
-    # mono-configured stream.
-    ASCCH=$(python3 - "${CONFIG:-}" <<'EOF' 2>/dev/null
+    # Channel configuration: what the SDP declares vs what a decoder
+    # emits, per codec. Two asymmetries are legitimate, both of the
+    # same shape (declared mono, decoder shows 2ch of identical
+    # content):
+    #   AAC  - ffmpeg presumes Parametric Stereo on ANY mono+SBR
+    #          stream (aacdec: "Treating HE-AAC mono as stereo") and
+    #          mirrors the one channel into two.
+    #   Opus - RFC 7587 mandates the rtpmap always read opus/48000/2
+    #          regardless of content (channelness is sprop-stereo,
+    #          absent = mono), and decoders fill a stereo layout from
+    #          a mono packet by duplication.
+    # Those pass ONLY if L and R decode identical; distinct content
+    # means real stereo leaked into a mono-configured stream. L16 and
+    # AAC-LC have no such excuse and must match exactly.
+    ASCCH=$(python3 - "$SDP" <<'EOF' 2>/dev/null
+import re
 import sys
 
 class Bits:
@@ -667,36 +675,65 @@ class Bits:
     def left(self):
         return len(self.d) * 8 - self.p
 
-b = Bits(bytes.fromhex(sys.argv[1]))
-aot = b.take(5)
-if aot == 31:
-    aot = 32 + b.take(6)
-if b.take(4) == 15:          # samplingFrequencyIndex escape
-    b.take(24)
-chans = b.take(4)
-sbr = ps = False
-if aot in (5, 29):           # explicit hierarchical SBR / SBR+PS
-    sbr, ps = True, aot == 29
-    if b.take(4) == 15:
-        b.take(24)
+def asc_channels(hexcfg):
+    b = Bits(bytes.fromhex(hexcfg))
     aot = b.take(5)
-if aot != 2 or chans == 0:   # PCE or non-LC core: not a raptor stream
+    if aot == 31:
+        aot = 32 + b.take(6)
+    if b.take(4) == 15:          # samplingFrequencyIndex escape
+        b.take(24)
+    chans = b.take(4)
+    sbr = ps = False
+    if aot in (5, 29):           # explicit hierarchical SBR / SBR+PS
+        sbr, ps = True, aot == 29
+        if b.take(4) == 15:
+            b.take(24)
+        aot = b.take(5)
+    if aot != 2 or chans == 0:   # PCE or non-LC core: not a raptor stream
+        sys.exit(1)
+    b.take(3)                    # GASpecificConfig flags (raptor: all 0)
+    if not sbr and b.left() >= 16:   # backward-compatible syncExtension
+        if b.take(11) == 0x2B7:
+            ext = b.take(5)
+            if ext == 5 and b.take(1):
+                sbr = True
+                if b.take(4) == 15:
+                    b.take(24)
+                if b.left() >= 12 and b.take(11) == 0x548:
+                    ps = b.take(1) == 1
+    return chans, "ps" if ps else "sbr" if sbr else "lc"
+
+sdp = sys.argv[1]
+main = None
+for sec in re.split(r"(?m)^m=", sdp)[1:]:
+    # The backchannel section is camera INPUT (sendonly): a receiver
+    # never decodes it, so channel assertions don't apply there.
+    if sec.startswith("audio") and not re.search(r"(?mi)^a=(sendonly|inactive)\s*$", sec):
+        main = sec
+        break
+if not main:
     sys.exit(1)
-b.take(3)                    # GASpecificConfig flags (raptor: all 0)
-if not sbr and b.left() >= 16:   # backward-compatible syncExtension
-    if b.take(11) == 0x2B7:
-        ext = b.take(5)
-        if ext == 5 and b.take(1):
-            sbr = True
-            if b.take(4) == 15:
-                b.take(24)
-            if b.left() >= 12 and b.take(11) == 0x548:
-                ps = b.take(1) == 1
-print(f"{chans} {'ps' if ps else 'sbr' if sbr else 'lc'}")
+rm = re.search(r"(?mi)^a=rtpmap:\d+\s+([A-Za-z0-9._-]+)/\d+(?:/(\d+))?", main)
+if not rm:
+    sys.exit(1)
+codec = rm.group(1).lower()
+if codec == "mpeg4-generic":
+    cm = re.search(r"config=([0-9A-Fa-f]+)", main)
+    if not cm:
+        sys.exit(1)
+    chans, mode = asc_channels(cm.group(1))
+    print(f"{chans} {mode}")
+elif codec == "opus":
+    st = re.search(r"(?i)(?:sprop-)?stereo\s*=\s*1", main)
+    print(f"{2 if st else 1} opus")
+elif codec == "l16":
+    print(f"{int(rm.group(2) or 1)} l16")
+else:
+    sys.exit(1)
 EOF
 )
     if [ -z "$ASCCH" ]; then
-        skip "audio channels (no parseable AAC config= in SDP)"
+        skip "audio channels (no decodable main audio track in SDP)"
     else
         DCH=${ASCCH% *}
         AMODE=${ASCCH#* }
@@ -704,7 +741,9 @@ EOF
         [ "$AMODE" = ps ] && EXP=2   # explicit PS reconstructs stereo
         if [ "${ACH:-0}" = "$EXP" ]; then
             ok "audio channels: decoded $ACH matches declared ($DCH ch, $AMODE)"
-        elif [ "$AMODE" = sbr ] && [ "$DCH" = 1 ] && [ "${ACH:-0}" = 2 ]; then
+        elif [ "$DCH" = 1 ] && [ "${ACH:-0}" = 2 ] && { [ "$AMODE" = sbr ] || [ "$AMODE" = opus ]; }; then
+            UPWHY="HE-AAC PS presumption"
+            [ "$AMODE" = opus ] && UPWHY="opus stereo layout (rtpmap is always /2)"
             LRRES=$(timeout 60 "$FFMPEG" -nostdin -v quiet -i "$WORK/ts.mkv" -map a -f f32le - 2>/dev/null | python3 -c '
 import struct, sys
 d = sys.stdin.buffer.read()
@@ -718,9 +757,9 @@ print(f"{n} frames, max|L-R|={maxd:.3g}")
 sys.exit(0 if n > 1000 and maxd < 1e-6 else 1)
 ')
             if [ $? -eq 0 ]; then
-                ok "audio channels: mono HE-AAC shown 2ch by decoder PS presumption, content mono ($LRRES)"
+                ok "audio channels: declared mono shown 2ch by $UPWHY, content mono ($LRRES)"
             else
-                bad "audio channels" "declared mono HE-AAC decodes 2ch with DIFFERENT content ($LRRES)"
+                bad "audio channels" "declared mono ($AMODE) decodes 2ch with DIFFERENT content ($LRRES)"
             fi
         else
             bad "audio channels" "declared $DCH ch ($AMODE) but decoder emits ${ACH:-none}"
