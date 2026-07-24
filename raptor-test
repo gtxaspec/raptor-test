@@ -52,6 +52,7 @@ Options:
   --json <file>        also write one JSON record per check (JSONL)
   --fps-tol <frac>     video fps tolerance vs nominal (default 0.15)
   --drift-ppm <n>      audio cadence drift ceiling in ppm (default 3000)
+  --drift-secs <n>     audio drift capture seconds (default 30; longer = tighter)
   --core               fast core subset: signaling, transports, wire,
                        content, RFC/robustness; skips sessions,
                        concurrency, players and all legs (self-check)
@@ -96,6 +97,7 @@ JSON_FILE=""
 FUZZ=0
 FPS_TOL=0.15
 DRIFT_PPM=3000
+DRIFT_SECS=30
 while [ $# -gt 0 ]; do
     case "$1" in
     --sub) SUB_URL=$2; shift 2 ;;
@@ -110,6 +112,7 @@ while [ $# -gt 0 ]; do
     --json) JSON_FILE=$2; shift 2 ;;
     --fps-tol) FPS_TOL=$2; shift 2 ;;
     --drift-ppm) DRIFT_PPM=$2; shift 2 ;;
+    --drift-secs) DRIFT_SECS=$2; shift 2 ;;
     --core) CORE=1; shift ;;
     --keep-logs) KEEP=1; shift ;;
     --user) RTSP_USER=$2; shift 2 ;;
@@ -561,18 +564,37 @@ else
     bad "A/V capture timestamps" "capture produced only $VP video packets"
 fi
 
-# ── 4b. Audio cadence/drift (nominal-rate check from the capture) ──
+# ── 4b. Audio cadence/drift (dedicated longer capture) ──
+# Drift needs a long lever arm: a device's audio sample clock can
+# wander hundreds of ppm over ~10s (measured on a T31 16k path), so a
+# 12s window swings by thousands regardless of estimator and only a
+# ~30s+ capture resolves the true rate. Take a dedicated audio-only
+# capture rather than reusing the 12s A/V one.
 if [ -n "$CONFIG" ] && [ "$AP" -gt 50 ]; then
     FS=1024
     [ ${#CONFIG} -ge 10 ] && FS=2048  # 5-byte BC-form ASC = HE-AAC, 2048/frame
-    DRIFT=$(python3 - "$WORK/a.pts" "$FS" "$ACLK" "$DRIFT_PPM" <<'EOF'
+    timeout -k 5 "$((DRIFT_SECS + 14))" "$FFMPEG" -nostdin -v quiet \
+        -rtsp_transport tcp -i "$URL" -map 0:a -c copy -copyinkf \
+        -t "$DRIFT_SECS" -f mp4 "$WORK/adrift.mp4" 2>/dev/null
+    "$FFPROBE" -v error -select_streams a -show_entries packet=pts_time \
+        -of csv=p=0 "$WORK/adrift.mp4" 2>/dev/null | grep -vE 'N/A|^$' >"$WORK/adrift.pts"
+    DRIFT=$(python3 - "$WORK/adrift.pts" "$FS" "$ACLK" "$DRIFT_PPM" <<'EOF'
 import sys
 a = [float(x) for x in open(sys.argv[1])]
 fr = int(sys.argv[2]) / int(sys.argv[3])
 ceil = float(sys.argv[4])
 n = len(a)
-ppm = ((a[-1] - a[0]) / ((n - 1) * fr) - 1) * 1e6
-print(f"{ppm:+.0f}ppm over {a[-1]-a[0]:.0f}s ({n} pkts), ceil {ceil:.0f}")
+# Least-squares slope of pts vs packet index gives the true packet
+# interval. The endpoint method ((last-first)/count) is dominated by
+# per-packet network/capture jitter over a short window — a couple ms
+# on the two endpoints swings it thousands of ppm — so regress instead.
+mx = (n - 1) / 2.0
+my = sum(a) / n
+num = sum((i - mx) * (t - my) for i, t in enumerate(a))
+den = sum((i - mx) ** 2 for i in range(n))
+slope = num / den if den else fr
+ppm = (slope / fr - 1) * 1e6
+print(f"{ppm:+.0f}ppm over {a[-1]-a[0]:.0f}s ({n} pkts, lsq), ceil {ceil:.0f}")
 sys.exit(0 if abs(ppm) < ceil else 1)
 EOF
 )
