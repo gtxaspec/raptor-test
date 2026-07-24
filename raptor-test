@@ -656,8 +656,8 @@ EOF
     #          absent = mono), and decoders fill a stereo layout from
     #          a mono packet by duplication.
     # Those pass ONLY if L and R decode identical; distinct content
-    # means real stereo leaked into a mono-configured stream. L16 and
-    # AAC-LC have no such excuse and must match exactly.
+    # means real stereo leaked into a mono-configured stream. G.711,
+    # L16 and AAC-LC have no such excuse and must match exactly.
     ASCCH=$(python3 - "$SDP" <<'EOF' 2>/dev/null
 import re
 import sys
@@ -713,10 +713,19 @@ for sec in re.split(r"(?m)^m=", sdp)[1:]:
         break
 if not main:
     sys.exit(1)
+# Codec + declared channels: prefer the rtpmap; fall back to the
+# RFC 3551 static payload-type table, since G.711 sections legally
+# omit the rtpmap (RTP/AVP 0 and 8 imply PCMU/8000/1 and PCMA/8000/1).
+STATIC_PT = {0: ("pcmu", 1), 8: ("pcma", 1), 10: ("l16", 2), 11: ("l16", 1)}
 rm = re.search(r"(?mi)^a=rtpmap:\d+\s+([A-Za-z0-9._-]+)/\d+(?:/(\d+))?", main)
-if not rm:
-    sys.exit(1)
-codec = rm.group(1).lower()
+if rm:
+    codec = rm.group(1).lower()
+    rmch = int(rm.group(2) or 1)
+else:
+    mline = re.match(r"audio\s+\d+\s+\S+\s+(\d+)", main)
+    if not mline or int(mline.group(1)) not in STATIC_PT:
+        sys.exit(1)
+    codec, rmch = STATIC_PT[int(mline.group(1))]
 if codec == "mpeg4-generic":
     cm = re.search(r"config=([0-9A-Fa-f]+)", main)
     if not cm:
@@ -726,8 +735,8 @@ if codec == "mpeg4-generic":
 elif codec == "opus":
     st = re.search(r"(?i)(?:sprop-)?stereo\s*=\s*1", main)
     print(f"{2 if st else 1} opus")
-elif codec == "l16":
-    print(f"{int(rm.group(2) or 1)} l16")
+elif codec in ("l16", "pcmu", "pcma"):
+    print(f"{rmch} {codec}")
 else:
     sys.exit(1)
 EOF
