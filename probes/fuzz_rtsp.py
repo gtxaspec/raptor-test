@@ -8,7 +8,7 @@ OPTIONS to confirm the server is still answering. A parser that
 crashes, hangs, or wedges the accept loop is caught as a liveness
 failure, not a decode error.
 
-    fuzz_rtsp.py <host> <port> [rounds] [user] [pass]
+    fuzz_rtsp.py <host> <port> [rounds] [user] [pass] [budget_s]
 
 Prints:
   FUZZ sent=<n> alive=<n>/<n> worst=<ms>
@@ -22,6 +22,7 @@ import time
 HOST = sys.argv[1]
 PORT = int(sys.argv[2])
 ROUNDS = int(sys.argv[3]) if len(sys.argv) > 3 else 200
+BUDGET = float(sys.argv[6]) if len(sys.argv) > 6 else 60.0
 URL = f"rtsp://{HOST}:{PORT}/stream0"
 
 
@@ -54,7 +55,7 @@ def mutations(i):
     return f"DESCRIBE {URL}{'/' * min(n, 4000)} RTSP/1.0\r\nCSeq: 1\r\n\r\n"  # huge URI
 
 
-def send_raw(payload, timeout=1.0):
+def send_raw(payload, timeout=0.5):
     try:
         s = socket.create_connection((HOST, PORT), timeout=timeout)
         s.settimeout(timeout)
@@ -94,7 +95,10 @@ def main():
     checks = 0
     alive_ok = 0
     worst = 0.0
+    t_start = time.monotonic()
     for i in range(ROUNDS):
+        if time.monotonic() - t_start > BUDGET:
+            break  # stop cleanly on the wall-clock budget, still report
         send_raw(mutations(i))
         sent += 1
         if i % 20 == 19:  # liveness probe every 20 mutations

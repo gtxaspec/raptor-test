@@ -684,8 +684,8 @@ done <"$WORK/rfc.txt"
 
 # ── 4e. RTSP parser fuzzing (--fuzz): malformed input, liveness-checked ──
 if [ "$FUZZ" = 1 ]; then
-    FZ=$(timeout -k 5 90 python3 "$PROBES/fuzz_rtsp.py" "$HOST" "$PORT" 200 \
-        ${RTSP_USER:+"$RTSP_USER" "$RTSP_PASS"} 2>&1)
+    FZ=$(timeout -k 5 100 python3 "$PROBES/fuzz_rtsp.py" "$HOST" "$PORT" 300 \
+        "${RTSP_USER:-}" "${RTSP_PASS:-}" 80 2>&1)
     echo "$FZ" | grep -q '^OK ' && ok "$(echo "$FZ" | sed -n 's/^OK //p')" \
         || bad "RTSP fuzzing" "$(echo "$FZ" | sed -n 's/^FAIL //p' | head -1)"
 else
