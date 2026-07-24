@@ -107,7 +107,7 @@ listed, logs kept), 2 = usage error.
 | RTSPS/TLS | (`--tls rtsps://host:port/path`) TLS handshake, DESCRIBE 200 over rtsps, and clean media through the encrypted transport |
 | RTMP push | (`--rtmp <listen-port>`) rsp pushes to a listener on this host; the received FLV carries video and decodes clean (catches HE-AAC ASC mislabels on the push path) |
 | WebRTC | (`--webrtc <whip-url>`) a real WHIP client (aiortc: SDP/ICE/DTLS-SRTP) decodes rwd's stream and measures framerate, stall stability, PTS monotonicity/cadence, and that audio decodes to real samples (Opus or G.711). Point at an **H264** stream (`?stream=N`) — rwd's WebRTC video is H264-only; signaling is HTTPS with Basic auth. Needs `tools/webrtc-venv` (fetch-tools.sh) |
-| go2rtc | Clean media through a restream; AAC `config=` passed through verbatim |
+| go2rtc | Clean media through a restream; AAC `config=` passed through verbatim; with credentials + a distinct sub, an authenticated substream must flow (regression for digest nonce reuse across producer connections, raptor issue #6); RTSP output port discovered from the API |
 | Frigate | Dockerized Frigate records via TCP and UDP inputs; recorded clips verified |
 | RHD HTTP | (`--rhd`) `/snap` returns a decodable JPEG of sane size (and refuses unauthenticated access when credentials are set); `/mjpeg` is `multipart/x-mixed-replace` carrying multiple JPEG parts that decode frame-by-frame with no errors |
 | RHD /audio | (`--rhd`) the HTTP audio stream (ADTS AAC, Ogg/Opus, or WAV/PCM, de-chunked) is framed correctly and decodes to PCM |

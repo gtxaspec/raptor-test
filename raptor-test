@@ -1070,7 +1070,12 @@ if [ -n "$GO2RTC" ]; then
     if curl -s -m 8 -X PUT "$GO2RTC/api/streams?name=$G2NAME&src=$ENC_URL" >/dev/null 2>&1; then
         G2HOST=${GO2RTC#http://}
         G2HOST=${G2HOST%%:*}
-        G2URL="rtsp://$G2HOST:8554/$G2NAME"
+        # go2rtc's RTSP output port is configurable; ask the API
+        # instead of assuming the default 8554.
+        G2RPORT=$(curl -s -m 6 "$GO2RTC/api" 2>/dev/null \
+            | python3 -c "import json,sys; print(json.load(sys.stdin).get('rtsp',{}).get('listen',':8554').rsplit(':',1)[-1])" 2>/dev/null)
+        G2RPORT=${G2RPORT:-8554}
+        G2URL="rtsp://$G2HOST:$G2RPORT/$G2NAME"
         sleep 2
         if timeout -k 5 $((DUR + 14)) "$FFMPEG" -nostdin -v warning -rtsp_transport tcp -i "$G2URL" -t "$DUR" -f null - >"$WORK/go2rtc.log" 2>&1             && [ "$(grep -ciE "$ERRPAT" "$WORK/go2rtc.log")" -eq 0 ]; then
             ok "go2rtc restream: clean media (${DUR}s)"
@@ -1078,8 +1083,38 @@ if [ -n "$GO2RTC" ]; then
             bad "go2rtc restream" "see below"
             show_errs "$WORK/go2rtc.log"
         fi
+        # Authenticated SUBSTREAM through go2rtc (regression: raptor
+        # issue #6 — go2rtc reuses digest nonces across producer
+        # connections; stateful-nonce servers reject the second
+        # stream while the first works).
+        if [ -n "$RTSP_USER" ] && [ "$SUB_URL" != "$URL" ]; then
+            G2SUB="rtauthsub$$"
+            SUBSRC=$(python3 - "$SUB_URL" "$RTSP_USER" "$RTSP_PASS" <<'EOF'
+import sys, urllib.parse
+u, user, pw = sys.argv[1], sys.argv[2], sys.argv[3]
+if "@" not in u.split("://", 1)[1].split("/", 1)[0]:
+    scheme, rest = u.split("://", 1)
+    u = f"{scheme}://{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(pw, safe='')}@{rest}"
+print(urllib.parse.quote(u, safe=""))
+EOF
+)
+            if curl -s -m 8 -X PUT "$GO2RTC/api/streams?name=$G2SUB&src=$SUBSRC" >/dev/null 2>&1; then
+                timeout -k 3 14 curl -s -m 12 "$GO2RTC/api/stream.mp4?src=$G2SUB" -o "$WORK/g2sub.mp4" 2>/dev/null
+                G2SZ=$(stat -c%s "$WORK/g2sub.mp4" 2>/dev/null || echo 0)
+                if [ "${G2SZ:-0}" -gt 10000 ]; then
+                    ok "go2rtc: authenticated substream flows (${G2SZ}B mp4)"
+                else
+                    bad "go2rtc authenticated substream" "only ${G2SZ:-0}B (digest nonce-reuse regression? see issue #6)"
+                fi
+                curl -s -m 6 -X DELETE "$GO2RTC/api/streams?name=$G2SUB" >/dev/null 2>&1
+            else
+                skip "go2rtc authenticated substream (stream registration failed)"
+            fi
+        else
+            skip "go2rtc authenticated substream (needs --user and a distinct --sub)"
+        fi
         if [ -n "$CONFIG" ]; then
-            G2SDP=$(python3 - "$G2HOST" 8554 "/$G2NAME" <<'EOF'
+            G2SDP=$(python3 - "$G2HOST" "$G2RPORT" "/$G2NAME" <<'EOF'
 import socket, sys
 host, port, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 s = socket.create_connection((host, port), timeout=5)
