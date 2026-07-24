@@ -3,16 +3,13 @@
 cross-track NTP<->RTP mapping skew an SR-honoring NVR would apply."""
 import sys
 
-from rtsplib import RtspSession, parse_sr, parse_rtp
+from rtsplib import RtspSession, audio_clock, parse_sr, parse_rtp
 
 host, port, path = sys.argv[1], sys.argv[2], sys.argv[3]
 dur = float(sys.argv[4]) if len(sys.argv) > 4 else 40
 s = RtspSession(host, port, path)
 _, sdp = s.describe()
-aclk = 16000
-for line in sdp.splitlines():
-    if "mpeg4-generic/" in line.lower():
-        aclk = int(line.split("/")[1])
+aclk = audio_clock(sdp, default=16000)
 s.setup("video", 0)
 s.setup("audio", 2)
 _, rtpinfo = s.play()

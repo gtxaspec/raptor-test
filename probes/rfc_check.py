@@ -13,6 +13,8 @@ import struct
 import sys
 import time
 
+from rtsplib import audio_clock
+
 host, port, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 sr_window = float(sys.argv[4]) if len(sys.argv) > 4 else 8.0
 auth_user = sys.argv[5] if len(sys.argv) > 5 else None
@@ -246,10 +248,7 @@ if srs[1]:
         vN, vR = srs[1][0][1], srs[1][0][2]
         aN, aR = srs[3][0][1], srs[3][0][2]
         vclk = 90000
-        aclk = 48000
-        for ln in sdp.splitlines():
-            if "mpeg4-generic/" in ln.lower():
-                aclk = int(ln.split("/")[1])
+        aclk = audio_clock(sdp, default=48000)
         def s32(x):
             return x - 2**32 if x > 2**31 else x
         tv = vN + s32((rtpinfo["video"][1] - vR) & 0xFFFFFFFF) / vclk

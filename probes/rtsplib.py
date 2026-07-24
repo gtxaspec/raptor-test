@@ -6,10 +6,39 @@ client; just enough protocol to DESCRIBE/SETUP/PLAY and iterate
 interleaved RTP/RTCP frames with a deadline.
 """
 import hashlib
+import re
 import socket
 import ssl
 import struct
 import time
+
+# RFC 3551 static audio payload types: sections carrying these may
+# legally omit the a=rtpmap line entirely (rsd's G.711 sections do).
+AUDIO_STATIC_PT_CLOCK = {0: 8000, 8: 8000, 10: 44100, 11: 44100}
+
+
+def audio_clock(sdp, default=48000):
+    """RTP clock of the first receivable audio section in an SDP.
+
+    Sendonly/inactive sections (e.g. the ONVIF backchannel) are camera
+    input and never carry the clock a receiver projects with, so they
+    are skipped. The clock comes from the section's rtpmap, or from
+    the RFC 3551 static payload-type table when there is no rtpmap.
+    Assuming a fixed clock here once produced a phantom -0.8s a/v skew
+    against G.711 (8kHz projected at the AAC default)."""
+    for sec in re.split(r"(?m)^m=", sdp)[1:]:
+        if not sec.startswith("audio"):
+            continue
+        if re.search(r"(?mi)^a=(sendonly|inactive)\s*$", sec):
+            continue
+        rm = re.search(r"(?mi)^a=rtpmap:\d+\s+[A-Za-z0-9._-]+/(\d+)", sec)
+        if rm:
+            return int(rm.group(1))
+        m0 = re.match(r"audio\s+\d+\s+\S+\s+(\d+)", sec)
+        if m0 and int(m0.group(1)) in AUDIO_STATIC_PT_CLOCK:
+            return AUDIO_STATIC_PT_CLOCK[int(m0.group(1))]
+        break
+    return default
 
 
 class RtspSession:
