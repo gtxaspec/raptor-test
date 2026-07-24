@@ -643,6 +643,89 @@ sys.exit(0 if want > 0 and abs(got - want) / want < 0.1 else 1)
 EOF
 )
     if [ $? -eq 0 ]; then ok "audio decodes at declared rate ($SAMPRES)"; else bad "audio decoded sample count" "$SAMPRES"; fi
+
+    # Channel configuration: what the ASC declares vs what a decoder
+    # emits. One asymmetry is legitimate: ffmpeg presumes Parametric
+    # Stereo on ANY mono+SBR stream (aacdec: "Treating HE-AAC mono as
+    # stereo") and mirrors the one channel into two, so declared-mono
+    # HE-AAC decoding as 2ch passes ONLY if L and R carry the identical
+    # signal; distinct content would mean real stereo leaked into a
+    # mono-configured stream.
+    ASCCH=$(python3 - "${CONFIG:-}" <<'EOF' 2>/dev/null
+import sys
+
+class Bits:
+    def __init__(self, data):
+        self.d = data
+        self.p = 0
+    def take(self, n):
+        v = 0
+        for _ in range(n):
+            v = (v << 1) | ((self.d[self.p >> 3] >> (7 - (self.p & 7))) & 1)
+            self.p += 1
+        return v
+    def left(self):
+        return len(self.d) * 8 - self.p
+
+b = Bits(bytes.fromhex(sys.argv[1]))
+aot = b.take(5)
+if aot == 31:
+    aot = 32 + b.take(6)
+if b.take(4) == 15:          # samplingFrequencyIndex escape
+    b.take(24)
+chans = b.take(4)
+sbr = ps = False
+if aot in (5, 29):           # explicit hierarchical SBR / SBR+PS
+    sbr, ps = True, aot == 29
+    if b.take(4) == 15:
+        b.take(24)
+    aot = b.take(5)
+if aot != 2 or chans == 0:   # PCE or non-LC core: not a raptor stream
+    sys.exit(1)
+b.take(3)                    # GASpecificConfig flags (raptor: all 0)
+if not sbr and b.left() >= 16:   # backward-compatible syncExtension
+    if b.take(11) == 0x2B7:
+        ext = b.take(5)
+        if ext == 5 and b.take(1):
+            sbr = True
+            if b.take(4) == 15:
+                b.take(24)
+            if b.left() >= 12 and b.take(11) == 0x548:
+                ps = b.take(1) == 1
+print(f"{chans} {'ps' if ps else 'sbr' if sbr else 'lc'}")
+EOF
+)
+    if [ -z "$ASCCH" ]; then
+        skip "audio channels (no parseable AAC config= in SDP)"
+    else
+        DCH=${ASCCH% *}
+        AMODE=${ASCCH#* }
+        EXP=$DCH
+        [ "$AMODE" = ps ] && EXP=2   # explicit PS reconstructs stereo
+        if [ "${ACH:-0}" = "$EXP" ]; then
+            ok "audio channels: decoded $ACH matches declared ($DCH ch, $AMODE)"
+        elif [ "$AMODE" = sbr ] && [ "$DCH" = 1 ] && [ "${ACH:-0}" = 2 ]; then
+            LRRES=$(timeout 60 "$FFMPEG" -nostdin -v quiet -i "$WORK/ts.mkv" -map a -f f32le - 2>/dev/null | python3 -c '
+import struct, sys
+d = sys.stdin.buffer.read()
+n = len(d) // 8
+maxd = 0.0
+for i in range(n):
+    l, r = struct.unpack_from("<ff", d, i * 8)
+    if abs(l - r) > maxd:
+        maxd = abs(l - r)
+print(f"{n} frames, max|L-R|={maxd:.3g}")
+sys.exit(0 if n > 1000 and maxd < 1e-6 else 1)
+')
+            if [ $? -eq 0 ]; then
+                ok "audio channels: mono HE-AAC shown 2ch by decoder PS presumption, content mono ($LRRES)"
+            else
+                bad "audio channels" "declared mono HE-AAC decodes 2ch with DIFFERENT content ($LRRES)"
+            fi
+        else
+            bad "audio channels" "declared $DCH ch ($AMODE) but decoder emits ${ACH:-none}"
+        fi
+    fi
 fi
 
 # Raw elementary stream: GOP cadence + per-frame SEI presence
