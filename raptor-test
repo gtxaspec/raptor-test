@@ -570,37 +570,64 @@ fi
 # 12s window swings by thousands regardless of estimator and only a
 # ~30s+ capture resolves the true rate. Take a dedicated audio-only
 # capture rather than reusing the 12s A/V one.
-if [ -n "$CONFIG" ] && [ "$AP" -gt 50 ]; then
-    FS=1024
-    [ ${#CONFIG} -ge 10 ] && FS=2048  # 5-byte BC-form ASC = HE-AAC, 2048/frame
+# Codec-agnostic: the nominal packet interval is the modal interval
+# of the capture itself (the encoder's rate-steering nudges are rare,
+# so the mode IS the nominal; AAC's 1024/2048-per-frame numbers fall
+# out of it automatically). NUT container because mp4 rejects G.711
+# and L16 payloads, and NUT preserves the exact RTP-derived timebase
+# where matroska would quantize pts to 1ms.
+if [ "$AP" -gt 50 ]; then
     timeout -k 5 "$((DRIFT_SECS + 14))" "$FFMPEG" -nostdin -v quiet \
         -rtsp_transport tcp -i "$URL" -map 0:a -c copy -copyinkf \
-        -t "$DRIFT_SECS" -f mp4 "$WORK/adrift.mp4" 2>/dev/null
+        -t "$DRIFT_SECS" -f nut "$WORK/adrift.nut" 2>/dev/null
     "$FFPROBE" -v error -select_streams a -show_entries packet=pts_time \
-        -of csv=p=0 "$WORK/adrift.mp4" 2>/dev/null | grep -vE 'N/A|^$' >"$WORK/adrift.pts"
-    DRIFT=$(python3 - "$WORK/adrift.pts" "$FS" "$ACLK" "$DRIFT_PPM" <<'EOF'
+        -of csv=p=0 "$WORK/adrift.nut" 2>/dev/null | grep -vE 'N/A|^$' >"$WORK/adrift.pts"
+    DRIFT=$(python3 - "$WORK/adrift.pts" "$DRIFT_PPM" <<'EOF'
+import collections
 import sys
 a = [float(x) for x in open(sys.argv[1])]
-fr = int(sys.argv[2]) / int(sys.argv[3])
-ceil = float(sys.argv[4])
+ceil = float(sys.argv[2])
 n = len(a)
+if n < 50:
+    print(f"only {n} packets captured")
+    sys.exit(2)
+# Nominal interval: mode of the deltas, binned at 10us because
+# ffprobe prints 6 decimals and 48k frame intervals (1024/48000)
+# alternate between adjacent microsecond prints. fr then comes from
+# the mean of the modal bin's members, not the bin label, to keep
+# microsecond precision (a 10us-rounded label alone would bias the
+# ppm by ~100 at 48k).
+deltas = [y - x for x, y in zip(a, a[1:])]
+bins = collections.Counter(round(d, 5) for d in deltas)
+key, cnt = bins.most_common(1)[0]
+if key <= 0 or cnt < 0.8 * len(deltas):
+    print(f"unstable framing: modal {key * 1000:g}ms covers {cnt}/{len(deltas)} steps")
+    sys.exit(2)
+sel = [d for d in deltas if round(d, 5) == key]
+fr = sum(sel) / len(sel)
 # Least-squares slope of pts vs packet index gives the true packet
 # interval. The endpoint method ((last-first)/count) is dominated by
-# per-packet network/capture jitter over a short window — a couple ms
-# on the two endpoints swings it thousands of ppm — so regress instead.
+# per-packet network/capture jitter over a short window - a couple ms
+# on the two endpoints swings it thousands of ppm - so regress
+# instead. The source's steering nudges make the slope track the real
+# sample clock while the modal step stays nominal, so slope-vs-mode
+# IS the drift.
 mx = (n - 1) / 2.0
 my = sum(a) / n
 num = sum((i - mx) * (t - my) for i, t in enumerate(a))
 den = sum((i - mx) ** 2 for i in range(n))
 slope = num / den if den else fr
 ppm = (slope / fr - 1) * 1e6
-print(f"{ppm:+.0f}ppm over {a[-1]-a[0]:.0f}s ({n} pkts, lsq), ceil {ceil:.0f}")
+print(f"{ppm:+.0f}ppm over {a[-1] - a[0]:.0f}s ({n} pkts, lsq vs modal {fr * 1000:g}ms), ceil {ceil:.0f}")
 sys.exit(0 if abs(ppm) < ceil else 1)
 EOF
 )
-    if [ $? -eq 0 ]; then ok "audio cadence vs nominal ($DRIFT)"; else bad "audio cadence drift" "$DRIFT"; fi
+    DRIFT_RC=$?
+    if [ $DRIFT_RC -eq 0 ]; then ok "audio cadence vs nominal ($DRIFT)"
+    elif [ $DRIFT_RC -eq 2 ]; then skip "audio drift ($DRIFT)"
+    else bad "audio cadence drift" "$DRIFT"; fi
 else
-    skip "audio drift (no AAC or too few audio packets)"
+    skip "audio drift (too few audio packets)"
 fi
 
 # ── 4c. Decoded-content validation ──
