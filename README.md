@@ -114,10 +114,39 @@ listed, logs kept), 2 = usage error.
 | Audio-only | Auto-detected from the SDP (m=audio, no m=video): video checks self-skip, clean-media asserts decoded time instead of frames, single-track probes SETUP the audio track, and the full transport/wire/session/RFC battery runs (validated against a live555 WAV source) |
 | Soak | (`--soak <minutes>`) endurance mode replacing the battery: repeated bounded captures plus device RSS/FD trending over the run (fails on >25% RSS growth or >3 new FDs in rvd/rsd) |
 | WebRTC talk-back | The WHIP offer carries a sendrecv audio track (aiortc silence); the answer direction must accept client audio and, with `--ssh`, the decoded audio must land in the device speaker ring mid-session |
+| RTSP fuzzing | (`--fuzz`) throws ~200 malformed requests (bad request lines, oversized/truncated headers, absurd Content-Length/CSeq, garbage methods, partial interleaved frames) at the parser, sending a well-formed OPTIONS between batches; a crash, hang, or wedged accept loop is caught as a liveness failure |
 | SRT | (`--srt`) connects as a caller to the SRT listener (rsr), confirms the MPEG-TS carries video, decodes the video clean, and decodes the audio all the way to PCM — the last step catches an ADTS sample-rate mislabel that a container probe would miss |
 | Codec matrix | `tools/codec-matrix.sh` sweeps l16/pcmu/pcma/opus/aac against **both** RTSP backends per codec, asserting the audio RTP timestamp step equals the codec's real frame duration (a server timestamping AAC at its 20ms chunk rate decodes fine but runs the clock 3x fast) |
 | Clips | Recorded files: streams present, durations aligned, full decode with zero errors (null-muxer dts nag and its repeat-tails excluded; file-level dts asserted to never move backward instead) |
 | Device | (`--ssh`) rsd CPU sane after the suite, connection count back at the pre-suite baseline, daemon log lines emitted during the run free of ERROR-level entries and crashes, framesource "losted buffers" counters flat across the run |
+
+## Self-tests
+
+The suite tests itself, because a conformance suite that never fails
+is worthless. All three run on localhost with no camera:
+
+- `tools/self-check.sh` — starts `probes/evil_server.py` (a
+  deliberately misbehaving RTSP/RTP server) in each break mode and
+  asserts every probe PASSes on correct media and FAILs on the one
+  broken property: silent-play (the vacuous-pass guard: a server that
+  answers PLAY but sends nothing must fail "clean media", not pass it),
+  sequence drops, backward timestamps, timestamp spikes, and a
+  garbage-transport-200. 10/10, deterministic.
+- `tools/host-battery.sh` — runs the real `--core` entrypoint against
+  a local `live555MediaServer`. The dry run of a CI job; the handful
+  of documented live555 deviations are allowlisted so a genuine
+  regression still turns it red.
+- `tools/impair-check.sh` — runs a server in a network namespace,
+  applies `tc netem` to its loopback, and proves the capture path
+  detects controlled loss (frames drop and decode errors appear under
+  15% loss) and recovers cleanly. Needs root; frame counts are
+  asserted so "0 errors" can never silently mean "no media".
+
+Run `tools/lint.sh` (shellcheck + ruff) before committing. Structured
+output for CI: `--json <file>` writes one JSONL record per check.
+Borderline thresholds are overridable per target: `--fps-tol`,
+`--drift-ppm` (and the matching manifest fields) so a marginal unit
+stops flapping an absolute limit.
 
 ## Design notes
 

@@ -48,6 +48,10 @@ Options:
   --rtmp <port>        listen for rsp's RTMP push on this port
   --webrtc <whip-url>  WebRTC leg via rwd WHIP (H264 stream; needs webrtc-venv)
   --gop <frames>       assert the measured GOP interval equals this value
+  --fuzz               throw malformed RTSP at the server, assert it survives
+  --json <file>        also write one JSON record per check (JSONL)
+  --fps-tol <frac>     video fps tolerance vs nominal (default 0.15)
+  --drift-ppm <n>      audio cadence drift ceiling in ppm (default 3000)
   --core               fast core subset: signaling, transports, wire,
                        content, RFC/robustness; skips sessions,
                        concurrency, players and all legs (self-check)
@@ -88,6 +92,10 @@ WEBRTC_URL=""
 GOP_EXPECT=""
 SOAK_MIN=""
 CORE=0
+JSON_FILE=""
+FUZZ=0
+FPS_TOL=0.15
+DRIFT_PPM=3000
 while [ $# -gt 0 ]; do
     case "$1" in
     --sub) SUB_URL=$2; shift 2 ;;
@@ -98,6 +106,10 @@ while [ $# -gt 0 ]; do
     --record-check) RECDIR=$2; shift 2 ;;
     --gop) GOP_EXPECT=$2; shift 2 ;;
     --soak) SOAK_MIN=$2; shift 2 ;;
+    --fuzz) FUZZ=1; shift ;;
+    --json) JSON_FILE=$2; shift 2 ;;
+    --fps-tol) FPS_TOL=$2; shift 2 ;;
+    --drift-ppm) DRIFT_PPM=$2; shift 2 ;;
     --core) CORE=1; shift ;;
     --keep-logs) KEEP=1; shift ;;
     --user) RTSP_USER=$2; shift 2 ;;
@@ -193,8 +205,15 @@ declare -a FAILED_NAMES
 # on the wire (RFC probe).
 ERRPAT='missed|dropping|discontinuity|corrupt|concealing|invalid data|error while decoding'
 
-ok() { echo "  PASS  $1"; PASS=$((PASS + 1)); }
-skip() { echo "  SKIP  $1"; SKIP=$((SKIP + 1)); }
+json_emit() {  # status name detail
+    [ -z "$JSON_FILE" ] && return
+    local st=$1 nm=$2 dt=${3:-}
+    nm=${nm//\\/\\\\}; nm=${nm//\"/\\\"}
+    dt=${dt//\\/\\\\}; dt=${dt//\"/\\\"}
+    printf '{"status":"%s","name":"%s","detail":"%s"}\n' "$st" "$nm" "$dt" >> "$JSON_FILE"
+}
+ok() { echo "  PASS  $1"; PASS=$((PASS + 1)); json_emit pass "$1"; }
+skip() { echo "  SKIP  $1"; SKIP=$((SKIP + 1)); json_emit skip "$1"; }
 
 print_result() {
     echo ""
@@ -211,6 +230,7 @@ bad() {
     echo "  FAIL  $1${2:+ — $2}"
     FAIL=$((FAIL + 1))
     FAILED_NAMES+=("$1")
+    json_emit fail "$1" "${2:-}"
 }
 
 CLIENT_PIDS=""
@@ -545,14 +565,15 @@ fi
 if [ -n "$CONFIG" ] && [ "$AP" -gt 50 ]; then
     FS=1024
     [ ${#CONFIG} -ge 10 ] && FS=2048  # 5-byte BC-form ASC = HE-AAC, 2048/frame
-    DRIFT=$(python3 - "$WORK/a.pts" "$FS" "$ACLK" <<'EOF'
+    DRIFT=$(python3 - "$WORK/a.pts" "$FS" "$ACLK" "$DRIFT_PPM" <<'EOF'
 import sys
 a = [float(x) for x in open(sys.argv[1])]
 fr = int(sys.argv[2]) / int(sys.argv[3])
+ceil = float(sys.argv[4])
 n = len(a)
 ppm = ((a[-1] - a[0]) / ((n - 1) * fr) - 1) * 1e6
-print(f"{ppm:+.0f}ppm over {a[-1]-a[0]:.0f}s ({n} pkts)")
-sys.exit(0 if abs(ppm) < 3000 else 1)
+print(f"{ppm:+.0f}ppm over {a[-1]-a[0]:.0f}s ({n} pkts), ceil {ceil:.0f}")
+sys.exit(0 if abs(ppm) < ceil else 1)
 EOF
 )
     if [ $? -eq 0 ]; then ok "audio cadence vs nominal ($DRIFT)"; else bad "audio cadence drift" "$DRIFT"; fi
@@ -566,14 +587,15 @@ if [ "$VP" -gt 30 ]; then
     W=$(echo "$VMETA" | cut -d, -f1)
     H=$(echo "$VMETA" | cut -d, -f2)
     NOMFPS=$(echo "$VMETA" | cut -d, -f3)
-    FPSRES=$(python3 - "$WORK/v.pts" "$NOMFPS" <<'EOF'
+    FPSRES=$(python3 - "$WORK/v.pts" "$NOMFPS" "$FPS_TOL" <<'EOF'
 import sys
 v = [float(x) for x in open(sys.argv[1])]
 num, den = (sys.argv[2].split("/") + ["1"])[:2]
 nom = float(num) / float(den or 1)
+tol = float(sys.argv[3])
 meas = (len(v) - 1) / (v[-1] - v[0])
-print(f"measured {meas:.2f}fps vs nominal {nom:.2f}")
-sys.exit(0 if nom > 0 and abs(meas - nom) / nom < 0.15 else 1)
+print(f"measured {meas:.2f}fps vs nominal {nom:.2f} (tol {tol:.0%})")
+sys.exit(0 if nom > 0 and abs(meas - nom) / nom < tol else 1)
 EOF
 )
     if [ $? -eq 0 ]; then ok "video frame rate ($FPSRES)"; else bad "video frame rate" "$FPSRES"; fi
@@ -659,6 +681,16 @@ while IFS= read -r line; do
     FAIL\ *) bad "${line#FAIL }" ;;
     esac
 done <"$WORK/rfc.txt"
+
+# ── 4e. RTSP parser fuzzing (--fuzz): malformed input, liveness-checked ──
+if [ "$FUZZ" = 1 ]; then
+    FZ=$(timeout -k 5 90 python3 "$PROBES/fuzz_rtsp.py" "$HOST" "$PORT" 200 \
+        ${RTSP_USER:+"$RTSP_USER" "$RTSP_PASS"} 2>&1)
+    echo "$FZ" | grep -q '^OK ' && ok "$(echo "$FZ" | sed -n 's/^OK //p')" \
+        || bad "RTSP fuzzing" "$(echo "$FZ" | sed -n 's/^FAIL //p' | head -1)"
+else
+    skip "RTSP parser fuzzing (--fuzz not given)"
+fi
 
 if [ "$CORE" = 1 ]; then
     skip "concurrency/players/legs (core mode)"
