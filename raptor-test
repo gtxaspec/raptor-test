@@ -54,6 +54,8 @@ Options:
   --drift-ppm <n>      audio cadence drift ceiling in ppm (default 3000)
   --bitrate-tol <f>    video bitrate tolerance vs SDP b=AS (default 0.35)
   --srt-secs <n>       SRT capture window in seconds (default 30)
+  --dur <n>            transport capture window in seconds; the A/V
+                       analysis capture is twice this (default 30)
   --srt-passphrase <p> SRT AES passphrase; also tests wrong-key rejection
   --drift-secs <n>     audio drift capture seconds (default 30; longer = tighter)
   --core               fast core subset: signaling, transports, wire,
@@ -81,7 +83,7 @@ rtsp://*) ;;
 esac
 SUB_URL=""
 SSH_TARGET=""
-DUR=12
+DUR=30
 KEEP=0
 GO2RTC=""
 FRIGATE=0
@@ -120,6 +122,7 @@ while [ $# -gt 0 ]; do
     --drift-ppm) DRIFT_PPM=$2; shift 2 ;;
     --bitrate-tol) BITRATE_TOL=$2; shift 2 ;;
     --srt-secs) SRT_SECS=$2; shift 2 ;;
+    --dur) DUR=$2; shift 2 ;;
     --srt-passphrase) SRT_PASSPHRASE=$2; shift 2 ;;
     --drift-secs) DRIFT_SECS=$2; shift 2 ;;
     --core) CORE=1; shift ;;
