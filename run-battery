@@ -113,6 +113,16 @@ bringup() {
             sed -i \"/^\\[\$s\\]/,/^\\[/{/^enabled *=/d}\" '$CONFIG_PATH'
             sed -i \"/^\\[\$s\\]/a enabled = true\" '$CONFIG_PATH'
         done
+        # Manifest config overrides (CONF_SET: section.key=value,
+        # space-separated, values without spaces) — some legs need the
+        # device pointed at the runner, e.g. push.url for the RTMP leg.
+        for kv in $CONF_SET; do
+            sec=\${kv%%.*}; rest=\${kv#*.}
+            key=\${rest%%=*}; val=\${rest#*=}
+            grep -q \"^\\[\$sec\\]\" '$CONFIG_PATH' || printf '\\n[%s]\\n' \"\$sec\" >>'$CONFIG_PATH'
+            sed -i \"/^\\[\$sec\\]/,/^\\[/{/^\$key *=/d}\" '$CONFIG_PATH'
+            sed -i \"/^\\[\$sec\\]/a \$key = \$val\" '$CONFIG_PATH'
+        done
         for d in$ordered; do
             [ -x '$DAEMON_BIN'/\$d ] || { echo \"MISSING \$d\"; exit 1; }
             nohup '$DAEMON_BIN'/\$d >/tmp/\$d.log 2>&1 </dev/null &
@@ -233,7 +243,7 @@ battery_for_target() {
     DAEMON_BIN=''; DAEMONS_BASE=''; DAEMONS_RECORD=''
     DAEMONS_RTSP='rsd'; DAEMONS_R555='rsd-555'; DAEMONS_SRT='rsr'
     DAEMONS_RHD='rhd'; DAEMONS_WEBRTC='rwd'; DAEMONS_RTMP='rsp'
-    DAEMONS_UVC='rwc'; RAM_MB=''; CONFIG_PATH=/etc/raptor.conf
+    DAEMONS_UVC='rwc'; RAM_MB=''; CONFIG_PATH=/etc/raptor.conf; CONF_SET=''
     # A syntax error (e.g. unquoted parens in NOTES) makes bash abort
     # sourcing mid-file, silently dropping every field after the bad
     # line. That must be a hard error, never a partial run.
