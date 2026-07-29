@@ -11,8 +11,13 @@
 #   ./run-battery --all           every targets/*.conf, then a matrix
 #   ./run-battery --list          list defined targets
 #
-# Bring-up (build/deploy/start daemons) is the caller's job — see
-# targets/README.md. This runs the tests, not the lab.
+# Bring-up: opt-in per target. A manifest that declares DAEMONS_BASE
+# (plus DAEMON_BIN and SSH) hands the runner its daemon lifecycle, and
+# each pass then runs the production-shaped set for that backend —
+# service daemons included, the RTSP twins never together. Manifests
+# without DAEMONS_BASE are untouched: the runner tests whatever is
+# already running and manages nothing. Building and deploying binaries
+# is always the caller's job. See targets/README.md.
 set -u
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -33,6 +38,149 @@ case "$1" in
     -h|--help) usage 0 ;;
     --list) list_targets; exit 0 ;;
 esac
+
+# Canonical start order: the ring producer first (it creates the rings
+# every consumer opens), then audio, then the service daemons, then the
+# stream backends. Also the kill list.
+CANON_ORDER="rvd rfs rad rod ric rmd rmr rsd rsd-555 rsr rhd rwd rsp rwc"
+
+# Each daemon gates on its own config section, so a profile is config
+# plus processes: starting rwd while [webrtc] is disabled just makes it
+# log and exit, and the leg that needed it fails for a reason that has
+# nothing to do with the code under test. Bring-up enables exactly the
+# sections its set needs (never disables anything else). RVD and RFS
+# have no gate.
+section_for() {
+    case $1 in
+    rad) echo audio ;;      rod) echo osd ;;         ric) echo ircut ;;
+    rmd) echo motion ;;     rmr) echo recording ;;   rsd|rsd-555) echo rtsp ;;
+    rsr) echo srt ;;        rhd) echo http ;;        rwd) echo webrtc ;;
+    rsp) echo push ;;       rwc) echo webcam ;;      *) echo "" ;;
+    esac
+}
+
+# bringup <listen-port|-> <daemon...> — replace whatever is running on
+# the target with exactly this set. No-op unless the manifest opted in.
+bringup() {
+    local wait_port=$1
+    shift
+    [ -n "$DAEMONS_BASE" ] || return 0
+    if [ -z "$SSH" ] || [ -z "$DAEMON_BIN" ]; then
+        echo "  BRING-UP SKIPPED: DAEMONS_BASE set but SSH=/DAEMON_BIN= missing" >&2
+        return 1
+    fi
+    local want=$* ordered="" d w
+    for d in $CANON_ORDER; do
+        for w in $want; do
+            [ "$d" = "$w" ] && ordered="$ordered $d"
+        done
+    done
+    local sections="" s
+    for d in $ordered; do
+        s=$(section_for "$d")
+        [ -n "$s" ] && case " $sections " in *" $s "*) ;; *) sections="$sections $s" ;; esac
+    done
+    echo "--- bring-up:$ordered ---"
+    # Readiness is polled, never slept: the ring must exist before
+    # consumers start (a consumer racing rvd gets a video-less SDP) and
+    # an NFS-hosted binary path may mount seconds after boot.
+    if ! ssh -o ConnectTimeout=10 "$SSH" "
+        set -u
+        case '$DAEMON_BIN' in /mnt/nfs*)
+            for i in \$(seq 30); do mount | grep -q /mnt/nfs && break; sleep 1; done ;;
+        esac
+        # Graceful first, and WAIT: RVD tears down the ISP/encoder in
+        # its SIGTERM path, and SIGKILLing it mid-teardown leaves the
+        # driver dirty enough that the next RVD hangs in IMP init.
+        # Poll for exit instead of guessing a sleep; anything still
+        # alive after 20s gets -9 and is named (a daemon that will not
+        # exit on TERM is itself a bug worth seeing).
+        killall $CANON_ORDER 2>/dev/null
+        for i in \$(seq 40); do
+            pidof $CANON_ORDER >/dev/null 2>&1 || break
+            sleep 0.5
+        done
+        if pidof $CANON_ORDER >/dev/null 2>&1; then
+            for p in \$(pidof $CANON_ORDER); do
+                echo \"  WARNING: \$(cat /proc/\$p/comm 2>/dev/null) ignored SIGTERM, killing\"
+            done
+            killall -9 $CANON_ORDER 2>/dev/null
+            sleep 2
+        fi
+        rm -f /dev/shm/rss_ring_* 2>/dev/null
+        for s in$sections; do
+            grep -q \"^\\[\$s\\]\" '$CONFIG_PATH' || printf '\\n[%s]\\n' \"\$s\" >>'$CONFIG_PATH'
+            sed -i \"/^\\[\$s\\]/,/^\\[/{/^enabled *=/d}\" '$CONFIG_PATH'
+            sed -i \"/^\\[\$s\\]/a enabled = true\" '$CONFIG_PATH'
+        done
+        for d in$ordered; do
+            [ -x '$DAEMON_BIN'/\$d ] || { echo \"MISSING \$d\"; exit 1; }
+            nohup '$DAEMON_BIN'/\$d >/tmp/\$d.log 2>&1 </dev/null &
+            # RVD/RFS bring the pipeline up before they fork; consumers
+            # are quick. Budget accordingly.
+            tries=40; case \$d in rvd|rfs) tries=120 ;; esac
+            for i in \$(seq \$tries); do pidof \$d >/dev/null && break; sleep 0.25; done
+            # A daemon whose feature is off in raptor.conf logs and
+            # exits by design; that is a legitimate shape, not a
+            # failure. The line lands in syslog rather than the capture
+            # file when the daemon has already forked, so check both.
+            # Anything else that is not running is a real failure.
+            if ! pidof \$d >/dev/null; then
+                if grep -q 'disabled in config' /tmp/\$d.log 2>/dev/null ||
+                   logread 2>/dev/null | tail -80 | grep -q \"\$d.*disabled in config\"; then
+                    echo \"  (\$d disabled in config)\"
+                else
+                    echo \"FAILED \$d\"; tail -3 /tmp/\$d.log; exit 1
+                fi
+            fi
+            case \$d in rvd|rfs)
+                # Readiness is FRAMES, not a file: the ring appears as
+                # soon as the producer maps it, but a consumer that
+                # connects before the first frame advertises a media-less
+                # SDP, and the suite fetches that SDP exactly once.
+                for i in \$(seq 60); do
+                    [ -e /dev/shm/rss_ring_main ] || { sleep 0.5; continue; }
+                    seq=\$('$DAEMON_BIN'/ringdump main 2>/dev/null |
+                        sed -n 's/.*Write seq: *\\([0-9]*\\).*/\\1/p')
+                    [ -n \"\$seq\" ] && [ \"\$seq\" -gt 0 ] && break
+                    sleep 0.5
+                done
+                if [ ! -e /dev/shm/rss_ring_main ]; then echo 'FAILED ring'; exit 1; fi ;;
+            esac
+        done
+        # A consumer's pid exists before it binds: rings open first.
+        # The suite's very first DESCRIBE would race that, and since it
+        # fetches the SDP exactly once, a lost race poisons every check
+        # that reads it.
+        if [ '$wait_port' != '-' ] && [ -n '$wait_port' ]; then
+            for i in \$(seq 60); do
+                netstat -ln 2>/dev/null | grep -q ':$wait_port ' && break
+                sleep 0.5
+            done
+            netstat -ln 2>/dev/null | grep -q ':$wait_port ' ||
+                { echo 'FAILED: port $wait_port never listened'; exit 1; }
+        fi
+        sleep 2
+        echo READY"; then
+        echo "  BRING-UP FAILED (see above)" >&2
+        printf '%s\t%s\tBRING-UP FAILED\n' "$CURRENT_TARGET" "${BRINGUP_LABEL:-?}" >>"$MATRIX_FILE"
+        OVERALL_FAIL=1
+        return 1
+    fi
+    # Per-profile memory accounting: headroom differs by an order of
+    # magnitude across the fleet (a 64MB SoC carves most of RAM away
+    # for rmem/ispmem), so the shape each measurement ran under is
+    # worth recording next to the numbers.
+    ssh -o ConnectTimeout=10 "$SSH" "
+        free | awk '/Mem:/{printf \"  mem: %dMB used, %dMB free\", \$3/1024, \$4/1024}'
+        for p in \$(pidof $CANON_ORDER 2>/dev/null); do
+            n=\$(cat /proc/\$p/comm 2>/dev/null)
+            r=\$(awk '/VmRSS/{print \$2}' /proc/\$p/status 2>/dev/null)
+            printf ' | %s %dk' \"\$n\" \"\${r:-0}\"
+        done
+        echo" 2>/dev/null || true
+    return 0
+}
 
 # One line of the final matrix per (target,backend): "target backend result"
 MATRIX_FILE=$(mktemp)
@@ -81,6 +229,11 @@ battery_for_target() {
     R555_PORT=''; R555_PATH0=stream0; R555_PATH1=stream1
     GO2RTC=''; FRIGATE=no; RECORD_CHECK=''; NOTES=''; GOP=''
     TLS=''; RTMP=''; WEBRTC=''
+    # Daemon profiles (opt-in; empty DAEMONS_BASE = manage nothing)
+    DAEMON_BIN=''; DAEMONS_BASE=''; DAEMONS_RECORD=''
+    DAEMONS_RTSP='rsd'; DAEMONS_R555='rsd-555'; DAEMONS_SRT='rsr'
+    DAEMONS_RHD='rhd'; DAEMONS_WEBRTC='rwd'; DAEMONS_RTMP='rsp'
+    DAEMONS_UVC='rwc'; RAM_MB=''; CONFIG_PATH=/etc/raptor.conf
     # A syntax error (e.g. unquoted parens in NOTES) makes bash abort
     # sourcing mid-file, silently dropping every field after the bad
     # line. That must be a hard error, never a partial run.
@@ -108,6 +261,18 @@ battery_for_target() {
     [ -n "$GOP" ] && common+=(--gop "$GOP")
     [ -n "$RHD" ]          && common+=(--rhd "$RHD")
 
+    # Base shape: what a deployed camera of this kind always runs.
+    # OSD and day/night are load, not decoration (ROD re-renders every
+    # second; RIC polls exposure and can switch ISP modes mid-run), so
+    # measurements taken without them would flatter the encoder.
+    local -a base_set=()
+    [ -n "$DAEMONS_BASE" ] && read -r -a base_set <<<"$DAEMONS_BASE"
+    if [ -n "$RECORD_CHECK" ] && [ -n "$DAEMONS_RECORD" ]; then
+        local -a rec_set=()
+        read -r -a rec_set <<<"$DAEMONS_RECORD"
+        base_set+=("${rec_set[@]}")
+    fi
+
     # Backend 1: rsd (compy) — also carries the backend-independent
     # legs (SRT, TLS, RTMP) since it is always present.
     local -a rsd_args=("${common[@]}")
@@ -115,6 +280,17 @@ battery_for_target() {
     [ -n "$TLS" ]  && rsd_args+=(--tls "$TLS")
     [ -n "$RTMP" ] && rsd_args+=(--rtmp "$RTMP")
     [ -n "$WEBRTC" ] && rsd_args+=(--webrtc "$WEBRTC")
+    # This pass's daemons: base + rsd + whichever extra backends its
+    # legs exercise. Multi-protocol coexistence is a real deployment;
+    # two RTSP backends at once is not, so rsd-555 is excluded here and
+    # gets its own pass.
+    BRINGUP_LABEL="rsd (compy RTSP)"
+    local -a p1=("${base_set[@]}" $DAEMONS_RTSP)
+    [ -n "$SRT" ]    && p1+=($DAEMONS_SRT)
+    [ -n "$RHD" ]    && p1+=($DAEMONS_RHD)
+    [ -n "$WEBRTC" ] && p1+=($DAEMONS_WEBRTC)
+    [ -n "$RTMP" ]   && p1+=($DAEMONS_RTMP)
+    bringup "$RTSP_PORT" "${p1[@]}" || return
     run_suite "rsd (compy RTSP)" \
         "rtsp://$HOST:$RTSP_PORT/$PATH0" \
         --sub "rtsp://$HOST:$RTSP_PORT/$PATH1" "${rsd_args[@]}"
@@ -127,6 +303,8 @@ battery_for_target() {
         [ -n "$USER" ]       && r555_args+=(--user "$USER" --pass "$PASS")
         [ -n "$GO2RTC" ]     && r555_args+=(--go2rtc "$GO2RTC")
         [ "$FRIGATE" = yes ] && r555_args+=(--frigate)
+        BRINGUP_LABEL="rsd-555 (live555 RTSP)"
+        bringup "$R555_PORT" "${base_set[@]}" $DAEMONS_R555 || return
         run_suite "rsd-555 (live555 RTSP)" \
             "rtsp://$HOST:$R555_PORT/$R555_PATH0" \
             --sub "rtsp://$HOST:$R555_PORT/$R555_PATH1" "${r555_args[@]}"
