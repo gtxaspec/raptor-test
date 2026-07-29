@@ -52,6 +52,7 @@ Options:
   --json <file>        also write one JSON record per check (JSONL)
   --fps-tol <frac>     video fps tolerance vs nominal (default 0.15)
   --drift-ppm <n>      audio cadence drift ceiling in ppm (default 3000)
+  --bitrate-tol <f>    video bitrate tolerance vs SDP b=AS (default 0.35)
   --drift-secs <n>     audio drift capture seconds (default 30; longer = tighter)
   --core               fast core subset: signaling, transports, wire,
                        content, RFC/robustness; skips sessions,
@@ -97,6 +98,7 @@ JSON_FILE=""
 FUZZ=0
 FPS_TOL=0.15
 DRIFT_PPM=3000
+BITRATE_TOL=0.35
 DRIFT_SECS=30
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -112,6 +114,7 @@ while [ $# -gt 0 ]; do
     --json) JSON_FILE=$2; shift 2 ;;
     --fps-tol) FPS_TOL=$2; shift 2 ;;
     --drift-ppm) DRIFT_PPM=$2; shift 2 ;;
+    --bitrate-tol) BITRATE_TOL=$2; shift 2 ;;
     --drift-secs) DRIFT_SECS=$2; shift 2 ;;
     --core) CORE=1; shift ;;
     --keep-logs) KEEP=1; shift ;;
@@ -652,6 +655,53 @@ EOF
         ok "video resolution sane (${W}x${H})"
     else
         bad "video resolution" "${W}x${H}"
+    fi
+
+    # Bitrate: the SDP's own b=AS hint (RFC 4566 5.8, kbps) vs what the
+    # capture actually carried. Advertising a wrong figure misleads
+    # bandwidth-sensitive clients (the live555 family sizes receive
+    # buffers from it), and a delivered rate far off the declared one is
+    # how silent throttling shows up (an fps-crippled encoder emits
+    # proportionally fewer bits). CBR converges over the 12s window but
+    # content sways it, so the tolerance is generous and flag-tunable.
+    VBAS=$(printf '%s\n' "$SDP" | awk '/^m=video/{v=1;next} /^m=/{v=0} v&&sub(/^b=AS:/,""){print;exit}' | tr -d '\r')
+    if [ -n "$VBAS" ] && [ "$VBAS" -gt 0 ] 2>/dev/null; then
+        "$FFPROBE" -v error -select_streams v -show_entries packet=pts_time,size \
+            -of csv=p=0 "$WORK/ts.mkv" 2>/dev/null | grep -vE 'N/A|^$' >"$WORK/v.psz"
+        BRRES=$(python3 - "$WORK/v.psz" "$VBAS" "$BITRATE_TOL" <<'EOF'
+import sys
+rows = [l.split(",") for l in open(sys.argv[1]) if "," in l]
+pts = [float(r[0]) for r in rows]
+sz = [int(r[1]) for r in rows]
+declared = int(sys.argv[2]) * 1000
+tol = float(sys.argv[3])
+span = pts[-1] - pts[0]
+if span < 5:
+    print(f"span too short ({span:.1f}s)")
+    sys.exit(2)
+bps = sum(sz) * 8 / span
+# Per-2s windows show whether the rate is steady or oscillating.
+win = {}
+for p, s in zip(pts, sz):
+    win.setdefault(int((p - pts[0]) // 2), []).append(s)
+rates = [sum(v) * 8 / 2 for k, v in sorted(win.items()) if k < int(span // 2)]
+lo, hi = (min(rates), max(rates)) if rates else (bps, bps)
+# Only OVERSHOOT fails: clients size buffers from b=AS, so exceeding
+# it is the harmful direction. Undershoot is legitimate (static or
+# dark scenes compress to almost nothing on these encoders) and is
+# reported for visibility; throttle-class bugs show up in the fps
+# checks instead.
+print(f"measured {bps/1e6:.2f}Mbps vs declared {declared/1e6:.2f} "
+      f"(windows {lo/1e6:.2f}..{hi/1e6:.2f}, overshoot tol {tol:.0%})")
+sys.exit(0 if bps <= declared * (1 + tol) else 1)
+EOF
+)
+        BR_RC=$?
+        if [ $BR_RC -eq 0 ]; then ok "video bitrate within b=AS ($BRRES)"
+        elif [ $BR_RC -eq 2 ]; then skip "video bitrate ($BRRES)"
+        else bad "video bitrate vs b=AS" "$BRRES"; fi
+    else
+        skip "video bitrate (no b=AS advertised)"
     fi
 fi
 if [ "$AP" -gt 30 ]; then
