@@ -1054,13 +1054,16 @@ fi
 # ── 7. Device health (raptor bench, --ssh) ──
 if [ -n "$SSH_TARGET" ]; then
     sleep 3
-    RSDLINE=$(ssh -o ConnectTimeout=8 "$SSH_TARGET" 'top -bn1' 2>/dev/null | grep -E '[r]sd -c' | head -1)
+    # Match whichever RTSP backend is serving (rsd or rsd-555), however
+    # it was launched (bare, full path, or -c style) — under per-backend
+    # bring-up only one of the twins runs.
+    RSDLINE=$(ssh -o ConnectTimeout=8 "$SSH_TARGET" 'top -bn1' 2>/dev/null | grep -E '[r]sd(-555)?( |$)' | head -1)
     # busybox top: PID PPID USER STAT VSZ %VSZ CPU %CPU COMMAND
     CPU=$(echo "$RSDLINE" | awk '{print $8}' | cut -d. -f1)
     if [ -n "$CPU" ] && [ "$CPU" -ge 0 ] 2>/dev/null && [ "$CPU" -lt 20 ]; then
-        ok "rsd CPU sane post-suite (${CPU}%)"
+        ok "RTSP daemon CPU sane post-suite (${CPU}%)"
     else
-        bad "rsd CPU post-suite" "${RSDLINE:-no rsd process found}"
+        bad "RTSP daemon CPU post-suite" "${RSDLINE:-no rsd/rsd-555 process found}"
     fi
     # Compare against the baseline taken before any suite traffic:
     # external viewers (an NVR watching a deployed camera) are not
