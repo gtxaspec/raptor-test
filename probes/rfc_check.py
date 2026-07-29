@@ -96,6 +96,22 @@ oline = next((ln for ln in sdp.splitlines() if ln.startswith("o=")), "")
 of = oline.split()
 o_ok = len(of) >= 6 and of[1] != "0" and of[5] != "0.0.0.0"
 emit(o_ok, "RFC4566 o= has session id and real address", oline)
+
+# b= lines must precede a= lines within a media section (RFC 4566
+# Section 5: fixed field order). Order-sensitive parsers, ffmpeg's
+# included, may ignore or misparse a late b=; this bit prudynt once
+# (its b=AS landed after a=control until reordered).
+_border_ok = True
+_border_detail = ""
+for _sec in sdp.split("\nm=")[1:]:
+    _seen_a = False
+    for _ln in _sec.splitlines():
+        if _ln.startswith("a="):
+            _seen_a = True
+        elif _ln.startswith("b=") and _seen_a:
+            _border_ok = False
+            _border_detail = f"'{_ln.strip()}' after a= in m={_sec.splitlines()[0]}"
+emit(_border_ok, "RFC4566 5 b= precedes a= in media sections", _border_detail)
 if any(ln.startswith("m=video") for ln in sdp.splitlines()):
     emit(True, "RFC4566 video media section", "")
 else:
