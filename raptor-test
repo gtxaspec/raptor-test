@@ -1405,7 +1405,21 @@ EOF
                 if [ "${G2SZ:-0}" -gt 10000 ]; then
                     ok "go2rtc: authenticated substream flows (${G2SZ}B mp4)"
                 else
-                    bad "go2rtc authenticated substream" "only ${G2SZ:-0}B (digest nonce-reuse regression? see issue #6)"
+                    # Distinguish the historical failure (camera rejects
+                    # go2rtc's reused digest nonce, issue #6) from an
+                    # unhealthy upstream. go2rtc's API does not retain
+                    # the producer's error, so probe the same URL with
+                    # the same credentials ourselves: if it streams for
+                    # us but not through go2rtc, the camera is healthy
+                    # and suspicion falls on go2rtc's digest handling.
+                    if timeout -k 5 15 "$FFPROBE" -v error -rtsp_transport tcp \
+                        -show_entries stream=codec_type -of csv=p=0 \
+                        "rtsp://$RTSP_USER:$RTSP_PASS@${SUB_URL#rtsp://}" >/dev/null 2>&1; then
+                        G2HINT="direct authenticated probe works: digest nonce-reuse regression? see issue #6"
+                    else
+                        G2HINT="direct authenticated probe fails too: upstream unhealthy, not an auth regression"
+                    fi
+                    bad "go2rtc authenticated substream" "only ${G2SZ:-0}B ($G2HINT)"
                 fi
                 curl -s -m 6 -X DELETE "$GO2RTC/api/streams?name=$G2SUB" >/dev/null 2>&1
             else
