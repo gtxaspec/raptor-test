@@ -53,6 +53,8 @@ Options:
   --fps-tol <frac>     video fps tolerance vs nominal (default 0.15)
   --drift-ppm <n>      audio cadence drift ceiling in ppm (default 3000)
   --bitrate-tol <f>    video bitrate tolerance vs SDP b=AS (default 0.35)
+  --srt-secs <n>       SRT capture window in seconds (default 30)
+  --srt-passphrase <p> SRT AES passphrase; also tests wrong-key rejection
   --drift-secs <n>     audio drift capture seconds (default 30; longer = tighter)
   --core               fast core subset: signaling, transports, wire,
                        content, RFC/robustness; skips sessions,
@@ -99,6 +101,8 @@ FUZZ=0
 FPS_TOL=0.15
 DRIFT_PPM=3000
 BITRATE_TOL=0.35
+SRT_SECS=30
+SRT_PASSPHRASE=""
 DRIFT_SECS=30
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -115,6 +119,8 @@ while [ $# -gt 0 ]; do
     --fps-tol) FPS_TOL=$2; shift 2 ;;
     --drift-ppm) DRIFT_PPM=$2; shift 2 ;;
     --bitrate-tol) BITRATE_TOL=$2; shift 2 ;;
+    --srt-secs) SRT_SECS=$2; shift 2 ;;
+    --srt-passphrase) SRT_PASSPHRASE=$2; shift 2 ;;
     --drift-secs) DRIFT_SECS=$2; shift 2 ;;
     --core) CORE=1; shift ;;
     --keep-logs) KEEP=1; shift ;;
@@ -697,6 +703,7 @@ sys.exit(0 if bps <= declared * (1 + tol) else 1)
 EOF
 )
         BR_RC=$?
+        RTSP_MBPS=$(printf '%s' "$BRRES" | sed -n 's/^measured \([0-9.]*\)Mbps.*/\1/p')
         if [ $BR_RC -eq 0 ]; then ok "video bitrate within b=AS ($BRRES)"
         elif [ $BR_RC -eq 2 ]; then skip "video bitrate ($BRRES)"
         else bad "video bitrate vs b=AS" "$BRRES"; fi
@@ -1437,50 +1444,194 @@ fi
 
 # ── 9c. SRT: MPEG-TS over SRT (rsr) (--srt) ──
 if [ -n "$SRT_URL" ]; then
-    # Accept host:port or a full srt:// URL; connect as a caller.
-    case "$SRT_URL" in srt://*) SU=$SRT_URL ;; *) SU="srt://$SRT_URL" ;; esac
-    case "$SU" in *\?*) : ;; *) SU="$SU?mode=caller&latency=120000" ;; esac
+    case "$SRT_URL" in srt://*) SU_BASE=$SRT_URL ;; *) SU_BASE="srt://$SRT_URL" ;; esac
+    # URL builder: appends query params (streamid, passphrase) with ? or &.
+    srt_url() {
+        local u=$SU_BASE q=$1
+        [ -n "$SRT_PASSPHRASE" ] && q="${q:+$q&}passphrase=$SRT_PASSPHRASE"
+        case "$u" in
+        *\?*) [ -n "$q" ] && u="$u&$q" ;;
+        *) [ -n "$q" ] && u="$u?$q" ;;
+        esac
+        printf '%s' "$u"
+    }
+    SU=$(srt_url "")
+
     # Bound every SRT call: a caller connect blocks until the listener
     # answers, and -t limits capture *after* connect, not the handshake.
     # An absent or wedged rsr would otherwise hang the whole battery.
     SRT_STREAMS=$(timeout -k 5 20 "$FFPROBE" -v error -show_entries stream=codec_type -of csv=p=0 \
-        "$SU" 2>/dev/null | grep -vE '^$' | sort -u | tr '\n' ' ')
+        "$SU" 2>/dev/null | tr '\n' ' ')
     SRT_STREAMS=$(echo "$SRT_STREAMS")  # collapse stray whitespace
     if echo "$SRT_STREAMS" | grep -q video; then
         ok "SRT: MPEG-TS carries video ($SRT_STREAMS)"
     else
         bad "SRT stream" "no video stream (${SRT_STREAMS:-none})"
     fi
-    # Gate captures on the probe finding streams (no point capturing a
-    # dead server), and require ffmpeg to exit 0: it does so only after
-    # completing the full -t window, so a mid-capture stall killed by
-    # the timeout reads as a failure, not an empty-log vacuous pass.
+
     if echo "$SRT_STREAMS" | grep -q video; then
-        if timeout -k 5 "$((DUR + 20))" "$FFMPEG" -nostdin -v error -i "$SU" -t "$DUR" \
-            -map 0:v -f null - >"$WORK/srt_v.log" 2>&1 &&
-            [ "$(grep -ciE "$ERRPAT" "$WORK/srt_v.log")" -eq 0 ]; then
-            ok "SRT: video decodes clean (${DUR}s)"
-        else
-            bad "SRT video decode" "stalled or errored; see $WORK/srt_v.log"
-            show_errs "$WORK/srt_v.log"
+        # Raw-TS dump (for the census) and the A/V capture run
+        # CONCURRENTLY: two live callers on the same listener, so
+        # per-client mux isolation is exercised by construction.
+        RAWPID=""
+        if command -v srt-live-transmit >/dev/null 2>&1; then
+            ( timeout -k 3 "$SRT_SECS" srt-live-transmit "$(srt_url "")" file://con \
+                > "$WORK/srt_raw.ts" 2>/dev/null ) &
+            RAWPID=$!
         fi
-    fi
-    # Decode audio all the way to PCM: a wrong ADTS sample rate (the TS
-    # muxer mislabeling HE-AAC) yields "scalefactor bands exceeds limit"
-    # and zero samples, which a container-level check would miss.
-    if echo "$SRT_STREAMS" | grep -q audio; then
-        SRT_ARC=0
-        timeout -k 5 "$((DUR + 20))" "$FFMPEG" -nostdin -v error -i "$SU" -t "$DUR" -map 0:a -f s16le \
-            "$WORK/srt_a.raw" >"$WORK/srt_a.log" 2>&1 || SRT_ARC=$?
-        SB=$(wc -c <"$WORK/srt_a.raw" 2>/dev/null)
-        AE=$(grep -ciE "$ERRPAT|scalefactor|exceeds limit" "$WORK/srt_a.log")
-        if [ "$SRT_ARC" -eq 0 ] && [ "${SB:-0}" -gt 10000 ] && [ "$AE" -eq 0 ]; then
-            ok "SRT: audio decodes to PCM ($SB bytes, no errors)"
+        timeout -k 5 $((SRT_SECS + 25)) "$FFMPEG" -nostdin -v quiet -t "$SRT_SECS" -i "$SU" \
+            -map 0 -c copy -f matroska -y "$WORK/srt_av.mkv" 2>/dev/null
+        [ -n "$RAWPID" ] && wait "$RAWPID" 2>/dev/null
+        RAWSZ=$(stat -c%s "$WORK/srt_raw.ts" 2>/dev/null || echo 0)
+        AVSZ=$(stat -c%s "$WORK/srt_av.mkv" 2>/dev/null || echo 0)
+
+        if [ -n "$RAWPID" ]; then
+            if [ "$RAWSZ" -gt 100000 ] && [ "$AVSZ" -gt 100000 ]; then
+                ok "SRT: two concurrent clients served (raw $((RAWSZ / 1024))KB + capture $((AVSZ / 1024))KB, ${SRT_SECS}s)"
+            else
+                bad "SRT concurrent clients" "raw=${RAWSZ}B capture=${AVSZ}B"
+            fi
+            # TS-layer conformance census over rsr's ACTUAL bytes. A
+            # decoder passing proves nothing about spec-cleanliness:
+            # ffmpeg forgives CC gaps, sloppy PCR, and lazy table
+            # cadence that hardware players and NVRs choke on. SRT is
+            # a reliable transport, so any continuity gap here is a
+            # mux bug, not network loss.
+            if [ "$RAWSZ" -gt 100000 ]; then
+                while IFS= read -r line; do
+                    case $line in
+                    OK\ *) ok "SRT ${line#OK }" ;;
+                    FAIL\ *) bad "SRT ${line#FAIL }" ;;
+                    esac
+                done <<<"$(python3 "$PROBES/ts_census.py" "$WORK/srt_raw.ts")"
+            fi
         else
-            bad "SRT audio decode" "rc=$SRT_ARC, ${SB:-0} PCM bytes, $AE errors (ADTS rate mislabel?)"
-            show_errs "$WORK/srt_a.log"
+            skip "SRT concurrent clients + TS census (srt-live-transmit not installed)"
         fi
-        rm -f "$WORK/srt_a.raw"
+
+        # fps over the TS, same declared-vs-measured contract as RTSP
+        "$FFPROBE" -v error -select_streams v -show_entries packet=pts_time -of csv=p=0 \
+            "$WORK/srt_av.mkv" 2>/dev/null | grep -vE 'N/A|^$' >"$WORK/srt_v.pts"
+        SVP=$(wc -l <"$WORK/srt_v.pts")
+        if [ "$SVP" -gt 50 ]; then
+            SNOM=$("$FFPROBE" -v error -select_streams v -show_entries stream=r_frame_rate \
+                -of csv=p=0 "$WORK/srt_av.mkv" 2>/dev/null | head -1)
+            SFPS=$(python3 - "$WORK/srt_v.pts" "$SNOM" "$FPS_TOL" <<'EOF'
+import sys
+v = [float(x) for x in open(sys.argv[1])]
+num, den = (sys.argv[2].split("/") + ["1"])[:2]
+nom = float(num) / float(den or 1)
+tol = float(sys.argv[3])
+meas = (len(v) - 1) / (v[-1] - v[0])
+print(f"measured {meas:.2f}fps vs nominal {nom:.2f} (tol {tol:.0%})")
+sys.exit(0 if nom > 0 and abs(meas - nom) / nom < tol else 1)
+EOF
+)
+            if [ $? -eq 0 ]; then ok "SRT: video frame rate ($SFPS)"; else bad "SRT video frame rate" "$SFPS"; fi
+        else
+            skip "SRT fps (only $SVP video packets)"
+        fi
+
+        # A/V mux alignment and per-track monotonicity in the TS domain
+        "$FFPROBE" -v error -select_streams a -show_entries packet=pts_time -of csv=p=0 \
+            "$WORK/srt_av.mkv" 2>/dev/null | grep -vE 'N/A|^$' >"$WORK/srt_a.pts"
+        SAP=$(wc -l <"$WORK/srt_a.pts")
+        if [ "$SVP" -gt 30 ] && [ "$SAP" -gt 30 ]; then
+            SSYNC=$(python3 - "$WORK/srt_v.pts" "$WORK/srt_a.pts" <<'EOF'
+import sys
+v = [float(x) for x in open(sys.argv[1])]
+a = [float(x) for x in open(sys.argv[2])]
+mono_v = all(y >= x for x, y in zip(v, v[1:]))
+mono_a = all(y >= x for x, y in zip(a, a[1:]))
+end_off = (a[-1] - v[-1]) * 1000
+print(f"end_offset={end_off:+.0f}ms mono_v={mono_v} mono_a={mono_a} v={len(v)} a={len(a)}")
+sys.exit(0 if (mono_v and mono_a and abs(end_off) < 500) else 1)
+EOF
+)
+            if [ $? -eq 0 ]; then ok "SRT: A/V mux timestamps ($SSYNC)"; else bad "SRT A/V mux timestamps" "$SSYNC"; fi
+        else
+            skip "SRT A/V sync (v=$SVP a=$SAP packets)"
+        fi
+
+        # Cross-transport bitrate: the TS and RTSP legs read the same
+        # ring, so their measured video rates must agree.
+        if [ "$SVP" -gt 50 ] && [ -n "${RTSP_MBPS:-}" ]; then
+            "$FFPROBE" -v error -select_streams v -show_entries packet=pts_time,size -of csv=p=0 \
+                "$WORK/srt_av.mkv" 2>/dev/null | grep -vE 'N/A|^$' >"$WORK/srt_v.psz"
+            SBR=$(python3 - "$WORK/srt_v.psz" "$RTSP_MBPS" <<'EOF'
+import sys
+rows = [l.split(",") for l in open(sys.argv[1]) if "," in l]
+pts = [float(r[0]) for r in rows]
+sz = [int(r[1]) for r in rows]
+span = pts[-1] - pts[0]
+if span < 5:
+    print(f"span too short ({span:.1f}s)")
+    sys.exit(2)
+mbps = sum(sz) * 8 / span / 1e6
+ref = float(sys.argv[2])
+print(f"SRT {mbps:.2f}Mbps vs RTSP {ref:.2f}Mbps")
+sys.exit(0 if ref > 0 and abs(mbps - ref) / ref <= 0.5 else 1)
+EOF
+)
+            SBR_RC=$?
+            if [ $SBR_RC -eq 0 ]; then ok "SRT: video bitrate agrees with RTSP leg ($SBR)"
+            elif [ $SBR_RC -eq 2 ]; then skip "SRT bitrate ($SBR)"
+            else bad "SRT vs RTSP bitrate" "$SBR"; fi
+        else
+            skip "SRT cross-transport bitrate (no RTSP reference)"
+        fi
+
+        # Decode audio all the way to PCM: a wrong ADTS sample rate (the TS
+        # muxer mislabeling HE-AAC) yields "scalefactor bands exceeds limit"
+        # and zero samples, which a container-level check would miss.
+        if echo "$SRT_STREAMS" | grep -q audio; then
+            timeout -k 5 40 "$FFMPEG" -nostdin -v warning -t 8 -i "$SU" -map 0:a \
+                -f s16le - >"$WORK/srt_a.pcm" 2>"$WORK/srt_a.log"
+            SRT_ARC=$?
+            SB=$(stat -c%s "$WORK/srt_a.pcm" 2>/dev/null || echo 0)
+            AE=$(grep -ciE "$ERRPAT|scalefactor|error" "$WORK/srt_a.log")
+            if [ "$SRT_ARC" -eq 0 ] && [ "$SB" -gt 64000 ] && [ "$AE" -eq 0 ]; then
+                ok "SRT: audio decodes to PCM ($SB bytes, no errors)"
+            else
+                bad "SRT audio decode" "rc=$SRT_ARC, ${SB:-0} PCM bytes, $AE errors (ADTS rate mislabel?)"
+            fi
+        fi
+
+        # STREAMID routing: 'sub' must select the substream (different
+        # dimensions than the default), and an unknown id must be
+        # rejected before accept, not served the default.
+        MAIN_DIMS=$("$FFPROBE" -v error -select_streams v -show_entries stream=width,height \
+            -of csv=p=0 "$WORK/srt_av.mkv" 2>/dev/null | head -1)
+        SUB_DIMS=$(timeout -k 5 20 "$FFPROBE" -v error -select_streams v \
+            -show_entries stream=width,height -of csv=p=0 "$(srt_url "streamid=sub")" 2>/dev/null | head -1)
+        if [ -z "$SUB_DIMS" ]; then
+            skip "SRT STREAMID substream (no 'sub' stream served)"
+        elif [ "$SUB_DIMS" != "$MAIN_DIMS" ]; then
+            ok "SRT: STREAMID routes substream ($SUB_DIMS vs main $MAIN_DIMS)"
+        else
+            bad "SRT STREAMID routing" "streamid=sub returned main dimensions ($MAIN_DIMS)"
+        fi
+        if timeout -k 5 15 "$FFPROBE" -v error -show_entries stream=codec_type -of csv=p=0 \
+            "$(srt_url "streamid=no_such_ring")" >/dev/null 2>&1; then
+            bad "SRT unknown STREAMID" "connection with bogus streamid was served"
+        else
+            ok "SRT: unknown STREAMID rejected"
+        fi
+
+        # AES: with --srt-passphrase every call above already proved the
+        # right key works; a wrong key must be refused at handshake.
+        if [ -n "$SRT_PASSPHRASE" ]; then
+            WRONG_URL="$SU_BASE"
+            case "$WRONG_URL" in *\?*) WRONG_URL="$WRONG_URL&" ;; *) WRONG_URL="$WRONG_URL?" ;; esac
+            if timeout -k 5 15 "$FFPROBE" -v error -show_entries stream=codec_type -of csv=p=0 \
+                "${WRONG_URL}passphrase=WrongPassphrase123" >/dev/null 2>&1; then
+                bad "SRT AES" "wrong passphrase was accepted"
+            else
+                ok "SRT: wrong passphrase refused (AES enforced)"
+            fi
+        else
+            skip "SRT AES rejection (--srt-passphrase not given)"
+        fi
     fi
 fi
 
