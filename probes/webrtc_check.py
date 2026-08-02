@@ -137,6 +137,25 @@ async def run():
         pass
     await pc.close()
 
+    # PATCH on the resource is WHIP's ICE-restart/trickle channel
+    # (draft-ietf-wish-whip 4.4). rwd does not implement it, and the
+    # thing that matters is that an unimplemented method is refused
+    # rather than silently accepted: a 2xx tells a client its ICE
+    # restart succeeded when nothing happened, and it then waits out a
+    # connection that is never coming back.
+    if resource:
+        purl = resource if "://" in resource else \
+            whip_url.split("/", 3)[0] + "//" + whip_url.split("/", 3)[2] + resource
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.patch(purl, data="", headers=headers, ssl=False) as pr:
+                    emit(pr.status in (400, 404, 405, 501),
+                         "WHIP unimplemented PATCH is refused, not silently accepted",
+                         f"HTTP {pr.status}")
+        except Exception as e:
+            emit(False, "WHIP unimplemented PATCH is refused, not silently accepted",
+                 f"{type(e).__name__}: {e}")
+
     # DELETE on the resource is how a client says it is done
     # (draft-ietf-wish-whip 4.2). A server that does not honour it
     # leaks the PeerConnection until some other timeout fires, which

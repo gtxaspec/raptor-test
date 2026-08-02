@@ -50,6 +50,8 @@ Options:
   --gop <frames>       assert the measured GOP interval equals this value
   --fuzz               throw malformed RTSP at the server, assert it survives
   --cold               RHD cold-start snapshots (adds ~55s idle; needs --rhd)
+  --producer-restart   restart the ring producer mid-stream, assert recovery
+                       (needs --ssh; disruptive, so it runs last)
   --json <file>        also write one JSON record per check (JSONL)
   --fps-tol <frac>     video fps tolerance vs nominal (default 0.15)
   --drift-ppm <n>      audio cadence drift ceiling in ppm (default 3000)
@@ -102,6 +104,7 @@ CORE=0
 JSON_FILE=""
 FUZZ=0
 COLD=0
+RESTART=0
 FPS_TOL=0.15
 DRIFT_PPM=3000
 BITRATE_TOL=0.35
@@ -120,6 +123,7 @@ while [ $# -gt 0 ]; do
     --soak) SOAK_MIN=$2; shift 2 ;;
     --fuzz) FUZZ=1; shift ;;
     --cold) COLD=1; shift ;;
+    --producer-restart) RESTART=1; shift ;;
     --json) JSON_FILE=$2; shift 2 ;;
     --fps-tol) FPS_TOL=$2; shift 2 ;;
     --drift-ppm) DRIFT_PPM=$2; shift 2 ;;
@@ -232,6 +236,54 @@ json_emit() {  # status name detail
 }
 ok() { echo "  PASS  $1"; PASS=$((PASS + 1)); json_emit pass "$1"; }
 skip() { echo "  SKIP  $1"; SKIP=$((SKIP + 1)); json_emit skip "$1"; }
+
+# ── 12. Producer restart (--producer-restart, needs --ssh): the ring
+#       producer dies and comes back under a live consumer. Every
+#       consumer has reconnect logic and nothing proves it end to end.
+#       Runs last: it deliberately breaks the stream everything else
+#       depends on. ──
+if [ "$RESTART" = 1 ] && [ -n "$SSH_TARGET" ]; then
+    PROD=rvd
+    ssh -o ConnectTimeout=8 "$SSH_TARGET" "pidof rfs >/dev/null 2>&1" && PROD=rfs
+    PRODBIN=$(ssh -o ConnectTimeout=8 "$SSH_TARGET" "readlink /proc/\$(pidof $PROD | awk '{print \$1}')/exe" 2>/dev/null)
+    if [ -z "$PRODBIN" ]; then
+        skip "producer restart ($PROD not running)"
+    else
+        # Kill it under a live client, then bring it back the way it
+        # was started, and require a fresh client to get real frames.
+        timeout -k 5 30 "$FFMPEG" -nostdin -v quiet -rtsp_transport tcp -i "$URL" \
+            -t 20 -c copy -f mp4 -y "$WORK/during_restart.mp4" >/dev/null 2>&1 &
+        VICTIM=$!
+        sleep 3
+        ssh -o ConnectTimeout=8 "$SSH_TARGET" "killall $PROD 2>/dev/null; sleep 3; nohup $PRODBIN >/tmp/$PROD.log 2>&1 </dev/null & sleep 1" >/dev/null 2>&1
+        # Wait for frames again, not merely for the process: a producer
+        # that is up but not producing leaves every consumer idle.
+        RESTART_OK=0
+        for i in $(seq 40); do
+            if ssh -o ConnectTimeout=8 "$SSH_TARGET" \
+                "test -e /dev/shm/rss_ring_main" >/dev/null 2>&1; then
+                RESTART_OK=1; break
+            fi
+            sleep 1
+        done
+        wait $VICTIM 2>/dev/null
+        if [ "$RESTART_OK" = 1 ]; then
+            ok "producer restart: $PROD came back and re-created its ring"
+        else
+            bad "producer restart" "$PROD ring never reappeared"
+        fi
+        # The real assertion: a consumer that survived the outage still
+        # serves a new client. rsd holds the ring across the restart.
+        if timeout -k 5 30 "$FFPROBE" -v error -rtsp_transport tcp \
+            -show_entries stream=codec_name -of csv "$URL" 2>/dev/null | grep -q .; then
+            ok "consumer serves a new client after a producer restart"
+        else
+            bad "consumer after producer restart" "no stream from $URL"
+        fi
+    fi
+elif [ "$RESTART" = 1 ]; then
+    skip "producer restart (--ssh not given)"
+fi
 
 print_result() {
     echo ""
@@ -922,6 +974,7 @@ while IFS= read -r line; do
     case "$line" in
     OK\ *) ok "${line#OK }" ;;
     FAIL\ *) bad "${line#FAIL }" ;;
+    SKIP\ *) skip "${line#SKIP }" ;;
     esac
 done <"$WORK/rfc.txt"
 

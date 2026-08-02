@@ -240,6 +240,9 @@ buf = leftover
 first = {}
 srs = {1: [], 3: []}
 compound_sdes = {1: False, 3: False}
+cname = {1: False, 3: False}
+first_at = {}
+last = {}
 inband_ps = {}  # NAL type -> first payload seen in band (SPS=7, PPS=8)
 t0 = time.time()
 s.settimeout(2)
@@ -258,9 +261,12 @@ while time.time() - t0 < sr_window:
             break
         pkt = buf[4:4 + ln]
         buf = buf[4 + ln:]
-        if ch in (0, 2) and ln >= 12 and ch not in first:
+        if ch in (0, 2) and ln >= 12:
             seq, ts = struct.unpack(">HI", pkt[2:8])
-            first[ch] = (seq, ts)
+            if ch not in first:
+                first[ch] = (seq, ts)
+                first_at[ch] = time.time()
+            last[ch] = (ts, time.time())
         if ch == 0 and ln >= 13:
             # Single-NAL packets only (RFC 6184 §5.6): parameter sets
             # are small and are never fragmented in practice, and STAP-A
@@ -285,6 +291,14 @@ while time.time() - t0 < sr_window:
             srlen = (struct.unpack(">H", pkt[2:4])[0] + 1) * 4
             if len(pkt) > srlen and pkt[srlen + 1] == 202:
                 compound_sdes[ch] = True
+                # RFC 3550 6.5.1: the SDES chunk must carry a CNAME
+                # (item type 1). It is the only identifier that ties
+                # this sender's tracks together for a receiver doing
+                # inter-media sync, so an SR without one is not usable
+                # for the A/V alignment the SR exists to provide.
+                sd = pkt[srlen:]
+                if len(sd) > 8 and sd[8:9] == b"\x01":
+                    cname[ch] = True
 
 if "video" in rtpinfo and 0 in first:
     m = rtpinfo["video"] == first[0]
@@ -299,6 +313,8 @@ if has_audio and "audio" in rtpinfo and 2 in first:
 if srs[1]:
     emit(True, "RFC3550 video Sender Reports present", f"{len(srs[1])} in {sr_window:.0f}s")
     emit(compound_sdes[1], "RFC3550 6.1 SR is compound with SDES", "")
+    emit(cname[1], "RFC3550 6.5.1 SDES carries CNAME",
+         "present" if cname[1] else "no CNAME item in SDES chunk")
     ntp_year = (srs[1][0][1] - 2208988800) / 31557600 + 1970
     emit(2020 < ntp_year < 2100, "RFC3550 SR NTP timestamp plausible", f"~year {ntp_year:.0f}")
     if len(srs[1]) >= 2:
@@ -342,6 +358,32 @@ if sprop and inband_ps:
                  f"sdp {dmap[nt].hex()} vs stream {inband_ps[nt].hex()}")
 elif not sprop:
     emit(False, "RFC6184 8.1 sprop-parameter-sets present for comparison", "absent from SDP")
+
+# -- RTP timestamp slope must match the declared clock (RFC 3550 5.1).
+#    A stream whose timestamps advance at the wrong rate plays at the
+#    wrong speed or drifts against audio no matter how healthy every
+#    other check looks, and the rate is declared, never inferred: this
+#    compares what the SDP promises with what the packets do. --
+for _ch, _label, _rate in ((0, "video", 90000),
+                           (2, "audio", audio_clock(sdp, default=0))):
+    if _ch in first and _ch in last and _rate:
+        _dts = (last[_ch][0] - first[_ch][1]) & 0xFFFFFFFF
+        _dt = last[_ch][1] - first_at[_ch]
+        if _dt > 1.0 and _dts:
+            _slope = _dts / _dt
+            emit(abs(_slope - _rate) <= 0.05 * _rate,
+                 f"RFC3550 5.1 {_label} RTP clock advances at the declared rate",
+                 f"{_slope:.0f} Hz measured over {_dt:.1f}s, SDP declares {_rate}")
+
+# -- Every a=control must resolve under the session it came from
+#    (RFC 2326 C.1.1). A control URL pointing somewhere else sends a
+#    client's SETUP to another session, and the SDP is the only place
+#    that mapping is stated. --
+_base = url.rstrip("/")
+_bad = [f"{m}:{u}" for m, u in track_url.items()
+        if u.startswith("rtsp://") and not u.startswith(_base)]
+emit(not _bad, "RFC2326 C.1.1 a=control URLs resolve under the session URL",
+     ", ".join(_bad) if _bad else f"{len(track_url)} track(s) under {_base}")
 
 # -- keepalive --
 head, _, _ = req("GET_PARAMETER", url, f"Session: {sess}\r\n")
@@ -387,8 +429,49 @@ if "200" in head.split("\r\n")[0]:
 else:
     emit(False, "RFC2326 PAUSE supported", head.split("\r\n")[0])
 
-head, _, _ = req("TEARDOWN", url, f"Session: {sess}\r\n")
+head, tail_body, tail_rest = req("TEARDOWN", url, f"Session: {sess}\r\n")
 emit("200" in head.split("\r\n")[0], "RFC2326 TEARDOWN 200", head.split("\r\n")[0])
+
+# RFC 3550 6.6: a source that stops sending SHOULD send BYE, so a
+# receiver can drop the SSRC at once instead of waiting out its
+# timeout. Read whatever the server sends before it closes.
+_bye = False
+_scan = tail_rest
+_deadline = time.time() + 2.0
+try:
+    s.settimeout(0.5)
+    # Bounded by the clock, not by the peer: a server that keeps
+    # sending after TEARDOWN would otherwise hold this loop open for
+    # as long as it liked.
+    while time.time() < _deadline and len(_scan) < 1 << 20:
+        _d = s.recv(65536)
+        if not _d:
+            break
+        _scan += _d
+except (socket.timeout, OSError):
+    pass
+_i = 0
+while _i + 4 <= len(_scan):
+    if _scan[_i:_i + 1] != b"$":
+        _i += 1
+        continue
+    _ln = struct.unpack(">H", _scan[_i + 2:_i + 4])[0]
+    _p = _scan[_i + 4:_i + 4 + _ln]
+    if len(_p) >= 4 and _p[1] == 203:
+        _bye = True
+        break
+    _i += 4 + _ln
+# RFC 3550 6.6 makes BYE a SHOULD, and neither backend sends one:
+# compy would need the feature and rsd-555 would need another live555
+# patch, which is not worth carrying for a SHOULD when RTSP TEARDOWN
+# has already told the receiver the session is over. Credited when a
+# server does send it, recorded as a known deviation when it does not,
+# rather than left as a permanently red check.
+if _bye:
+    emit(True, "RFC3550 6.6 BYE sent on teardown", "BYE seen")
+else:
+    print("SKIP RFC3550 6.6 BYE on teardown -- not sent (SHOULD; TEARDOWN "
+          "already ends the session)", flush=True)
 s.close()
 
 # -- Robustness: malformed requests must get 4xx, never break the server --
