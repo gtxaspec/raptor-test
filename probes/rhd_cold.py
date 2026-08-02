@@ -19,7 +19,6 @@ the two, served inline it is their sum. Run this before any other
 JPEG traffic -- an MJPEG viewer holds the encoder up and there is no
 cold path left to test.
 """
-import os
 import ssl
 import sys
 import threading
