@@ -241,6 +241,22 @@ json_emit() {  # status name detail
 ok() { echo "  PASS  $1"; PASS=$((PASS + 1)); json_emit pass "$1"; }
 skip() { echo "  SKIP  $1"; SKIP=$((SKIP + 1)); json_emit skip "$1"; }
 
+print_result() {
+    echo ""
+    echo "=== RESULT: $PASS passed, $FAIL failed, $SKIP skipped ==="
+    if [ "$FAIL" -gt 0 ]; then
+        printf '  failed: %s\n' "${FAILED_NAMES[@]}"
+        echo "  logs kept in: $WORK"
+        exit 1
+    fi
+    [ "$KEEP" = 1 ] && echo "  logs kept in: $WORK"
+    exit 0
+}
+
+# Legs that deliberately disturb the stream everything else
+# depends on: always the last thing the suite does, in every
+# mode, so nothing downstream measures the damage.
+late_legs() {
 # ── 11b. Wall-clock step (--clock-step, needs --ssh): NTP drags the
 #        clock forward on every boot. RTP timestamps are a media clock
 #        and must not follow it; RTCP SR NTP is wall clock and should.
@@ -337,29 +353,30 @@ if [ "$RESTART" = 1 ] && [ -n "$SSH_TARGET" ]; then
         else
             bad "producer restart" "$PROD ring never reappeared"
         fi
-        # The real assertion: a consumer that survived the outage still
-        # serves a new client. rsd holds the ring across the restart.
-        if timeout -k 5 30 "$FFPROBE" -v error -rtsp_transport tcp \
-            -show_entries stream=codec_name -of csv "$URL" 2>/dev/null | grep -q .; then
-            ok "consumer serves a new client after a producer restart"
+        # The real assertion: the consumer recovers. Not instantly --
+        # the ring file exists the moment the producer maps it, but
+        # frames come later and the consumer reconnects on its own
+        # tick, so recovery is a bounded wait, and how long it took is
+        # the interesting number.
+        REC_T0=$(date +%s)
+        REC_OK=0
+        for i in $(seq 15); do
+            if timeout -k 5 12 "$FFPROBE" -v error -rtsp_transport tcp \
+                -show_entries stream=codec_name -of csv "$URL" 2>/dev/null | grep -q .; then
+                REC_OK=1; break
+            fi
+            sleep 2
+        done
+        REC_EL=$(( $(date +%s) - REC_T0 ))
+        if [ "$REC_OK" = 1 ]; then
+            ok "consumer serves a new client after a producer restart (${REC_EL}s to recover)"
         else
-            bad "consumer after producer restart" "no stream from $URL"
+            bad "consumer after producer restart" "no stream from $URL after ${REC_EL}s"
         fi
     fi
 elif [ "$RESTART" = 1 ]; then
     skip "producer restart (--ssh not given)"
 fi
-
-print_result() {
-    echo ""
-    echo "=== RESULT: $PASS passed, $FAIL failed, $SKIP skipped ==="
-    if [ "$FAIL" -gt 0 ]; then
-        printf '  failed: %s\n' "${FAILED_NAMES[@]}"
-        echo "  logs kept in: $WORK"
-        exit 1
-    fi
-    [ "$KEEP" = 1 ] && echo "  logs kept in: $WORK"
-    exit 0
 }
 bad() {
     echo "  FAIL  $1${2:+ — $2}"
@@ -559,6 +576,7 @@ if [ -n "$SOAK_MIN" ]; then
     else
         skip "soak device trends (--ssh not given)"
     fi
+    late_legs
     print_result
 fi
 
@@ -1055,6 +1073,7 @@ fi
 
 if [ "$CORE" = 1 ]; then
     skip "concurrency/players/legs (core mode)"
+    late_legs
     print_result
 fi
 
@@ -2004,4 +2023,6 @@ else
     skip "external recording check (--record-check not given)"
 fi
 
+
+late_legs
 print_result
