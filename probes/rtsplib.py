@@ -170,7 +170,24 @@ class RtspSession:
         rtpinfo = {}
         for part in headers.get("rtp-info", "").split(","):
             d = dict(kv.split("=", 1) for kv in part.strip().split(";") if "=" in kv)
-            key = "audio" if "audio" in d.get("url", "") else "video"
+            url = d.get("url", "").strip()
+            # Resolve against the a=control URLs from DESCRIBE. The
+            # suffix carries no meaning of its own (compy names tracks
+            # video/audio, live555 names them trackN), and a server may
+            # list tracks that are not in the SDP it just served: this
+            # one advertises a third track anchored at seq=0 rtptime=0.
+            # Guessing from the URL text lands that on video and
+            # silently replaces the real anchor with zeros, so an
+            # unrecognized track is skipped instead.
+            key = None
+            for media, ctl in (getattr(self, "tracks", None) or {}).items():
+                if url and (url == ctl or url.rstrip("/").endswith(ctl.rsplit("/", 1)[-1])):
+                    key = media
+                    break
+            if key is None:
+                if getattr(self, "tracks", None):
+                    continue
+                key = "audio" if "audio" in url else "video"
             try:
                 rtpinfo[key] = (int(d["seq"]), int(d["rtptime"]))
             except (KeyError, ValueError):
