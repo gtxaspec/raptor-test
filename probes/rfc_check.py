@@ -7,6 +7,8 @@ Emits one line per check: "OK <name> -- <detail>" or "FAIL <name> -- <detail>".
 Exit code 0 even on FAILs (the caller tallies); nonzero only on transport
 errors that prevent the probe from running.
 """
+import base64
+import binascii
 import hashlib
 import socket
 import struct
@@ -175,6 +177,30 @@ aurl = track_url.get("audio", url + "/audio")
 # the primary interleaved pair instead.
 primary_url = vurl if "video" in track_url or not track_url else aurl
 
+# -- Transport spec acceptance (RFC 2326 §12.39). "RTP/AVP" and
+#    "RTP/AVP/UDP" name the same thing: the lower transport defaults to
+#    UDP when omitted, so a server that takes one MUST take the other.
+#    ffmpeg, VLC and mpv all send the explicit form, and a server that
+#    rejects it is unreachable from every one of them while a bare
+#    RTP/AVP probe still passes. Each spelling gets a fresh session that
+#    is torn down immediately -- this is about the SETUP answer only. --
+for spec in ("RTP/AVP;unicast;client_port=41000-41001",
+             "RTP/AVP/UDP;unicast;client_port=41002-41003"):
+    probe = socket.create_connection((host, port), timeout=6)
+    _s, _c, _sock = s, cseq, probe
+    s, cseq = probe, 0
+    head, _, _ = req("SETUP", primary_url, f"Transport: {spec}\r\n")
+    code = head.split("\r\n")[0]
+    tsess = None
+    for ln in head.split("\r\n"):
+        if ln.lower().startswith("session"):
+            tsess = ln.split(":")[1].split(";")[0].strip()
+    if tsess:
+        req("TEARDOWN", url, f"Session: {tsess}\r\n")
+    probe.close()
+    s, cseq = _s, _c
+    emit("200" in code, f"RFC2326 12.39 SETUP accepts {spec.split(';')[0]}", code)
+
 # -- SETUP both tracks, PLAY, RTP-Info --
 sess = None
 head, _, _ = req("SETUP", primary_url, "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n")
@@ -214,6 +240,7 @@ buf = leftover
 first = {}
 srs = {1: [], 3: []}
 compound_sdes = {1: False, 3: False}
+inband_ps = {}  # NAL type -> first payload seen in band (SPS=7, PPS=8)
 t0 = time.time()
 s.settimeout(2)
 while time.time() - t0 < sr_window:
@@ -234,6 +261,23 @@ while time.time() - t0 < sr_window:
         if ch in (0, 2) and ln >= 12 and ch not in first:
             seq, ts = struct.unpack(">HI", pkt[2:8])
             first[ch] = (seq, ts)
+        if ch == 0 and ln >= 13:
+            # Single-NAL packets only (RFC 6184 §5.6): parameter sets
+            # are small and are never fragmented in practice, and STAP-A
+            # aggregation is unpacked below.
+            payload = pkt[12 + 4 * (pkt[0] & 0x0F) :] if pkt[0] & 0x0F else pkt[12:]
+            if payload:
+                nt = payload[0] & 0x1F
+                if nt in (7, 8) and nt not in inband_ps:
+                    inband_ps[nt] = payload
+                elif nt == 24:  # STAP-A
+                    off = 1
+                    while off + 2 <= len(payload):
+                        sz = struct.unpack(">H", payload[off : off + 2])[0]
+                        nal = payload[off + 2 : off + 2 + sz]
+                        if nal and (nal[0] & 0x1F) in (7, 8):
+                            inband_ps.setdefault(nal[0] & 0x1F, nal)
+                        off += 2 + sz
         if ch in (1, 3) and ln >= 28 and pkt[1] == 200:
             ntp_hi, ntp_lo, rtpts = struct.unpack(">III", pkt[8:20])
             srs[ch].append((time.time() - t0, ntp_hi + ntp_lo / 2**32, rtpts))
@@ -274,6 +318,30 @@ if srs[1]:
              f"a/v skew {skew:+.0f}ms")
 else:
     emit(False, "RFC3550 video Sender Reports present", f"none within {sr_window:.0f}s")
+
+# -- sprop-parameter-sets must be the parameter sets actually sent
+#    (RFC 6184 §8.1). A decoder that trusts the SDP and never sees a
+#    correction decodes with the wrong geometry or fails outright, and
+#    the mismatch is invisible to any check that only asks whether the
+#    attribute is present. --
+sprop = ""
+for ln in sdp.splitlines():
+    if "sprop-parameter-sets=" in ln:
+        sprop = ln.split("sprop-parameter-sets=", 1)[1].split(";")[0].strip()
+if sprop and inband_ps:
+    declared = []
+    for b64 in sprop.split(","):
+        try:
+            declared.append(base64.b64decode(b64 + "=" * (-len(b64) % 4)))
+        except (ValueError, binascii.Error):
+            pass
+    dmap = {n[0] & 0x1F: n for n in declared if n}
+    for nt, label in ((7, "SPS"), (8, "PPS")):
+        if nt in dmap and nt in inband_ps:
+            emit(dmap[nt] == inband_ps[nt], f"RFC6184 8.1 sprop {label} matches in-band {label}",
+                 f"sdp {dmap[nt].hex()} vs stream {inband_ps[nt].hex()}")
+elif not sprop:
+    emit(False, "RFC6184 8.1 sprop-parameter-sets present for comparison", "absent from SDP")
 
 # -- keepalive --
 head, _, _ = req("GET_PARAMETER", url, f"Session: {sess}\r\n")
