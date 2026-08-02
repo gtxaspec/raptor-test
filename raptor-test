@@ -308,10 +308,22 @@ if [ "$CLOCKSTEP" = 1 ] && [ -n "$SSH_TARGET" ]; then
             bad "wall-clock step: RTP timeline follows wall clock" \
                 "max RTP gap ${CS_GAP}s after a ${STEP}s step — receivers see a discontinuity"
         fi
+        # Two legitimate designs for the SR NTP field, and the check
+        # names which one is in play rather than picking a winner.
+        # RFC 3550 6.4.1 calls it wallclock time, which is what a
+        # gettimeofday-based sender (live555) reports. compy derives it
+        # from CLOCK_MONOTONIC plus a one-time offset on purpose (see
+        # compy src/rtcp.c): that keeps the NTP<->RTP mapping stable
+        # across a step, at the cost of an absolute time that no longer
+        # tracks the clock. What would be broken either way is the RTP
+        # timeline moving, and that is asserted above.
         if python3 -c "import sys; sys.exit(0 if float('$CS_SR') > $STEP / 2 else 1)"; then
-            ok "wall-clock step: RTCP SR NTP followed the clock (${CS_SR}s)"
+            ok "wall-clock step: SR NTP tracked the clock, RFC3550 6.4.1 wallclock (${CS_SR}s)"
+        elif python3 -c "import sys; sys.exit(0 if float('$CS_SR') < 5 else 1)"; then
+            ok "wall-clock step: SR NTP<->RTP mapping held across the step (monotonic-derived, deviates from RFC3550 6.4.1 by design)"
         else
-            skip "RTCP SR NTP step not observed (${CS_SR}s; SR cadence may straddle the step)"
+            bad "wall-clock step: SR NTP moved by ${CS_SR}s" \
+                "neither wallclock-tracking (~${STEP}s) nor mapping-stable (~0s)"
         fi
     fi
 elif [ "$CLOCKSTEP" = 1 ]; then
