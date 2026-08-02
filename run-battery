@@ -354,7 +354,35 @@ battery_for_target() {
         printf '%s\t%s\tn/a\n' "$name" "rsd-555 (live555 RTSP)" >>"$MATRIX_FILE"
     fi
 
-    # Backend 3: signing. Every pass above runs with sei_timecode and
+    # Backend 3: H.265. Every other pass runs H.264, so RFC 7798
+    # packetization, its parameter-set attributes and the HEVC decode
+    # path are otherwise never exercised. Gated on the SoC: T30, T31,
+    # T32, T33, T40 and T41 encode H.265; the older parts do not, and
+    # asking them to would fail for the wrong reason. The sub stream is
+    # flipped rather than the main one, so a target keeps a working
+    # H.264 endpoint throughout.
+    case " t30 t31 t32 t33 t40 t41 " in
+    *" $SOC "*) H265_OK=1 ;;
+    *) H265_OK='' ;;
+    esac
+    if [ -n "$H265_OK" ] && [ -n "$DAEMONS_BASE" ]; then
+        local -a h265_args=(--core)
+        [ -n "$SSH" ]  && h265_args+=(--ssh "$SSH")
+        [ -n "$USER" ] && h265_args+=(--user "$USER" --pass "$PASS")
+        BRINGUP_LABEL="h265 (sub stream)"
+        local saved_conf=$CONF_SET
+        CONF_SET="$CONF_SET stream1.codec=h265"
+        if bringup "$RTSP_PORT" "${base_set[@]}" $DAEMONS_RTSP; then
+            run_suite "h265 (sub stream)" "rtsp://$HOST:$RTSP_PORT/$PATH1" "${h265_args[@]}"
+        fi
+        CONF_SET=$saved_conf
+    else
+        printf '%s\t%s\t%s\n' "$name" "h265 (sub stream)" \
+            "$([ -n "$H265_OK" ] && echo 'n/a' || echo "n/a (SOC $SOC has no H.265 encoder)")" \
+            >>"$MATRIX_FILE"
+    fi
+
+    # Backend 4: signing. Every pass above runs with sei_timecode and
     # sign_snapshots off, which is how they ship, so the SEI check
     # skips and no signed artifact is ever produced -- the provenance
     # path is the one feature the battery cannot see. Signing rewrites

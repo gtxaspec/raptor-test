@@ -120,6 +120,7 @@ else:
     emit(any(ln.startswith("m=audio") for ln in sdp.splitlines()),
          "RFC4566 media section present (audio-only source)", "")
 has_audio = any(ln.startswith("m=audio") for ln in sdp.splitlines())
+is_h265 = "H265" in sdp.upper()
 controls = sum(1 for ln in sdp.splitlines() if ln.startswith("a=control:"))
 emit(controls >= 1, "RFC4566 a=control present", f"{controls} entries")
 if "H265" in sdp or "H264" in sdp:
@@ -268,11 +269,13 @@ while time.time() - t0 < sr_window:
                 first_at[ch] = time.time()
             last[ch] = (ts, time.time())
         if ch == 0 and ln >= 13:
-            # Single-NAL packets only (RFC 6184 §5.6): parameter sets
-            # are small and are never fragmented in practice, and STAP-A
-            # aggregation is unpacked below.
+            # Parameter sets are small and are sent whole, so only
+            # single-NAL and aggregation packets are unpacked; the
+            # fragmentation forms carry slice data. H.264 (RFC 6184
+            # §5.6) and H.265 (RFC 7798 §4.4) differ in NAL header
+            # width, type field and aggregation payload type.
             payload = pkt[12 + 4 * (pkt[0] & 0x0F) :] if pkt[0] & 0x0F else pkt[12:]
-            if payload:
+            if payload and not is_h265:
                 nt = payload[0] & 0x1F
                 if nt in (7, 8) and nt not in inband_ps:
                     inband_ps[nt] = payload
@@ -283,6 +286,18 @@ while time.time() - t0 < sr_window:
                         nal = payload[off + 2 : off + 2 + sz]
                         if nal and (nal[0] & 0x1F) in (7, 8):
                             inband_ps.setdefault(nal[0] & 0x1F, nal)
+                        off += 2 + sz
+            elif len(payload) >= 2:
+                nt = (payload[0] >> 1) & 0x3F
+                if nt in (32, 33, 34) and nt not in inband_ps:
+                    inband_ps[nt] = payload
+                elif nt == 48:  # AP
+                    off = 2
+                    while off + 2 <= len(payload):
+                        sz = struct.unpack(">H", payload[off : off + 2])[0]
+                        nal = payload[off + 2 : off + 2 + sz]
+                        if len(nal) >= 2 and ((nal[0] >> 1) & 0x3F) in (32, 33, 34):
+                            inband_ps.setdefault((nal[0] >> 1) & 0x3F, nal)
                         off += 2 + sz
         if ch in (1, 3) and ln >= 28 and pkt[1] == 200:
             ntp_hi, ntp_lo, rtpts = struct.unpack(">III", pkt[8:20])
@@ -340,24 +355,40 @@ else:
 #    correction decodes with the wrong geometry or fails outright, and
 #    the mismatch is invisible to any check that only asks whether the
 #    attribute is present. --
-sprop = ""
-for ln in sdp.splitlines():
-    if "sprop-parameter-sets=" in ln:
-        sprop = ln.split("sprop-parameter-sets=", 1)[1].split(";")[0].strip()
-if sprop and inband_ps:
-    declared = []
-    for b64 in sprop.split(","):
-        try:
-            declared.append(base64.b64decode(b64 + "=" * (-len(b64) % 4)))
-        except (ValueError, binascii.Error):
-            pass
-    dmap = {n[0] & 0x1F: n for n in declared if n}
-    for nt, label in ((7, "SPS"), (8, "PPS")):
-        if nt in dmap and nt in inband_ps:
-            emit(dmap[nt] == inband_ps[nt], f"RFC6184 8.1 sprop {label} matches in-band {label}",
-                 f"sdp {dmap[nt].hex()} vs stream {inband_ps[nt].hex()}")
-elif not sprop:
-    emit(False, "RFC6184 8.1 sprop-parameter-sets present for comparison", "absent from SDP")
+def _b64(x):
+    try:
+        return base64.b64decode(x + "=" * (-len(x) % 4))
+    except (ValueError, binascii.Error):
+        return b""
+
+
+declared = {}
+if is_h265:
+    # RFC 7798 §7.1: each parameter set gets its own attribute.
+    for attr, nt in (("sprop-vps=", 32), ("sprop-sps=", 33), ("sprop-pps=", 34)):
+        for ln in sdp.splitlines():
+            if attr in ln:
+                declared[nt] = _b64(ln.split(attr, 1)[1].split(";")[0].strip())
+    labels = ((32, "VPS"), (33, "SPS"), (34, "PPS"))
+    rfc = "RFC7798 7.1"
+else:
+    sprop = ""
+    for ln in sdp.splitlines():
+        if "sprop-parameter-sets=" in ln:
+            sprop = ln.split("sprop-parameter-sets=", 1)[1].split(";")[0].strip()
+    for n in (_b64(x) for x in sprop.split(",") if x):
+        if n:
+            declared[n[0] & 0x1F] = n
+    labels = ((7, "SPS"), (8, "PPS"))
+    rfc = "RFC6184 8.1"
+
+if declared and inband_ps:
+    for nt, label in labels:
+        if nt in declared and nt in inband_ps:
+            emit(declared[nt] == inband_ps[nt], f"{rfc} sprop {label} matches in-band {label}",
+                 f"sdp {declared[nt].hex()} vs stream {inband_ps[nt].hex()}")
+elif not declared:
+    emit(False, f"{rfc} sprop parameter sets present for comparison", "absent from SDP")
 
 # -- RTP timestamp slope must match the declared clock (RFC 3550 5.1).
 #    A stream whose timestamps advance at the wrong rate plays at the
