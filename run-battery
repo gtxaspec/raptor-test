@@ -123,6 +123,25 @@ bringup() {
             sed -i \"/^\\[\$sec\\]/,/^\\[/{/^\$key *=/d}\" '$CONFIG_PATH'
             sed -i \"/^\\[\$sec\\]/a \$key = \$val\" '$CONFIG_PATH'
         done
+        # Pre-flight: a binary whose loader cannot resolve it dies
+        # instantly and reads as a mysterious start failure. Deploying
+        # --static binaries without --static-stdcxx cost a full battery
+        # exactly this way (rsr and rsd-555 need libstdc++, which the
+        # image does not ship), so name the missing library up front
+        # instead of leaving it in a daemon log.
+        missing=''
+        for d in$ordered; do
+            if ldd '$DAEMON_BIN'/\$d 2>&1 | grep -q 'not found'; then
+                missing=\"\$missing \$d(\$(ldd '$DAEMON_BIN'/\$d 2>&1 | \
+                    sed -n 's/^[[:space:]]*\\([^ ]*\\) => not found/\\1/p' | tr '\\n' ',' ))\"
+            fi
+        done
+        if [ -n \"\$missing\" ]; then
+            echo \"UNRESOLVED LIBRARIES:\$missing\"
+            echo \"  (a --static deploy still needs --static-stdcxx for the C++ daemons)\"
+            exit 1
+        fi
+
         # Pre-fault every binary before the liveness clock starts: a
         # cold binary demand-paged over NFS can stall in execve long
         # enough to blow any reasonable budget, and until execve
@@ -168,6 +187,11 @@ bringup() {
                 if grep -q 'disabled in config' /tmp/\$d.log 2>/dev/null ||
                    logread 2>/dev/null | tail -80 | grep -q \"\$d.*disabled in config\"; then
                     echo \"  (\$d disabled in config)\"
+                elif grep -q 'already running' /tmp/\$d.log 2>/dev/null; then
+                    # A survivor of the previous pass still holds the
+                    # pidfile, so the new instance refused to daemonize.
+                    echo \"FAILED \$d: an older instance survived teardown\"
+                    tail -3 /tmp/\$d.log; exit 1
                 else
                     echo \"FAILED \$d\"; tail -3 /tmp/\$d.log; exit 1
                 fi
