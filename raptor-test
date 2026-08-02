@@ -1883,6 +1883,16 @@ fi
 # ~5s, so a fresh listener gets a connection within one cycle).
 if [ -n "$RTMP_PORT" ]; then
     RTMP_REC="$WORK/rtmp_push.flv"
+    # Ask the device to start pushing now. With [push] autostart off
+    # the daemon sits idle until this point instead of retrying into a
+    # port nobody is listening on yet and filling the device log with
+    # connect failures the log scan then reports as a fault. Harmless
+    # when autostart is left on: the push is already running.
+    # The JSON passthrough, not the bare verb: `raptorctl rsp start` is
+    # the process-lifecycle command and no-ops on an already-running
+    # daemon, so it never reaches rsp's own start handler.
+    [ -n "$SSH_TARGET" ] && ssh -o ConnectTimeout=8 "$SSH_TARGET" \
+        'raptorctl -j "{\"daemon\":\"rsp\",\"cmd\":\"start\"}"' >/dev/null 2>&1
     # rsp reconnects every ~5s and sends fresh sequence headers on each
     # connect. Listen long enough to span a full reconnect so the
     # capture starts at a clean stream head, not mid-GOP.
@@ -1911,6 +1921,10 @@ if [ -n "$RTMP_PORT" ]; then
         bad "RTMP push" "nothing received on :$RTMP_PORT in 25s (is [push] url set to this host?)"
         tail -2 "$WORK/rtmp_listen.log" | sed 's/^/          /'
     fi
+    # Stop pushing again: the listener is gone, and leaving it running
+    # only resumes the connect-failure spam for the rest of the pass.
+    [ -n "$SSH_TARGET" ] && ssh -o ConnectTimeout=8 "$SSH_TARGET" \
+        'raptorctl -j "{\"daemon\":\"rsp\",\"cmd\":\"stop\"}"' >/dev/null 2>&1
 fi
 
 # ── 9f. WebRTC (--webrtc <whip-url>): real WHIP/ICE/DTLS-SRTP client ──

@@ -203,7 +203,12 @@ bringup() {
                 # SDP, and the suite fetches that SDP exactly once.
                 for i in \$(seq 60); do
                     [ -e /dev/shm/rss_ring_main ] || { sleep 0.5; continue; }
-                    seq=\$('$DAEMON_BIN'/ringdump main 2>/dev/null |
+                    # ringdump reports on stderr, so 2>/dev/null threw
+                    # away the very line being parsed: this gate has
+                    # been waiting out its full timeout on every
+                    # bring-up and proceeding on the ring file alone,
+                    # which is exactly what it was written not to do.
+                    seq=\$('$DAEMON_BIN'/ringdump main 2>&1 |
                         sed -n 's/.*Write seq: *\\([0-9]*\\).*/\\1/p')
                     [ -n \"\$seq\" ] && [ \"\$seq\" -gt 0 ] && break
                     sleep 0.5
