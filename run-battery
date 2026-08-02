@@ -343,6 +343,10 @@ battery_for_target() {
     [ -n "$SRT" ]  && rsd_args+=(--srt "$SRT")
     [ -n "$SRT_PASS" ] && rsd_args+=(--srt-passphrase "$SRT_PASS")
     [ -n "$RHD" ]  && rsd_args+=(--cold)
+    # Both legs deliberately disturb the stream, so they run last
+    # inside this pass, and every later pass brings its daemons up
+    # from scratch anyway. They need ssh to reach the device.
+    [ -n "$SSH" ]  && rsd_args+=(--clock-step --producer-restart)
     [ -n "$TLS" ]  && rsd_args+=(--tls "$TLS")
     [ -n "$RTMP" ] && rsd_args+=(--rtmp "$RTMP")
     [ -n "$WEBRTC" ] && rsd_args+=(--webrtc "$WEBRTC")
