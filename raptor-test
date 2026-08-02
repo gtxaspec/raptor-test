@@ -51,6 +51,8 @@ Options:
   --fuzz               throw malformed RTSP at the server, assert it survives
   --cold               RHD cold-start snapshots (adds ~55s idle; needs --rhd)
   --producer-restart   restart the ring producer mid-stream, assert recovery
+  --clock-step         step the camera clock mid-stream, assert the media
+                       timeline survives it (needs --ssh)
                        (needs --ssh; disruptive, so it runs last)
   --json <file>        also write one JSON record per check (JSONL)
   --fps-tol <frac>     video fps tolerance vs nominal (default 0.15)
@@ -105,6 +107,7 @@ JSON_FILE=""
 FUZZ=0
 COLD=0
 RESTART=0
+CLOCKSTEP=0
 FPS_TOL=0.15
 DRIFT_PPM=3000
 BITRATE_TOL=0.35
@@ -124,6 +127,7 @@ while [ $# -gt 0 ]; do
     --fuzz) FUZZ=1; shift ;;
     --cold) COLD=1; shift ;;
     --producer-restart) RESTART=1; shift ;;
+    --clock-step) CLOCKSTEP=1; shift ;;
     --json) JSON_FILE=$2; shift 2 ;;
     --fps-tol) FPS_TOL=$2; shift 2 ;;
     --drift-ppm) DRIFT_PPM=$2; shift 2 ;;
@@ -236,6 +240,67 @@ json_emit() {  # status name detail
 }
 ok() { echo "  PASS  $1"; PASS=$((PASS + 1)); json_emit pass "$1"; }
 skip() { echo "  SKIP  $1"; SKIP=$((SKIP + 1)); json_emit skip "$1"; }
+
+# ── 11b. Wall-clock step (--clock-step, needs --ssh): NTP drags the
+#        clock forward on every boot. RTP timestamps are a media clock
+#        and must not follow it; RTCP SR NTP is wall clock and should.
+#        Bounded and reverted, with ntpd stopped so it cannot fight
+#        the step or undo it mid-measurement. ──
+if [ "$CLOCKSTEP" = 1 ] && [ -n "$SSH_TARGET" ]; then
+    STEP=120
+    NTPD_WAS=$(ssh -o ConnectTimeout=8 "$SSH_TARGET" 'pgrep -x ntpd >/dev/null && echo yes || echo no' 2>/dev/null)
+    ssh -o ConnectTimeout=8 "$SSH_TARGET" \
+        '[ -x /etc/init.d/S49ntpd ] && /etc/init.d/S49ntpd stop >/dev/null 2>&1; killall ntpd 2>/dev/null; exit 0' >/dev/null 2>&1
+    (
+        sleep 6
+        # Step forward, hold, step back: a bounded move keeps TLS
+        # certs valid and leaves the device where it started.
+        ssh -o ConnectTimeout=8 "$SSH_TARGET" "date -s \"@\$(( \$(date +%s) + $STEP ))\"" >/dev/null 2>&1
+    ) &
+    STEPPER=$!
+    CS=$(timeout -k 5 60 python3 "$PROBES/clock_step.py" "$HOST" "$PORT" "$RPATH" \
+        "${RTSP_USER:-}" "${RTSP_PASS:-}" 20 2>&1)
+    wait $STEPPER 2>/dev/null
+    # Always put the clock back and restore ntpd, whatever happened.
+    ssh -o ConnectTimeout=8 "$SSH_TARGET" "date -s \"@\$(( \$(date +%s) - $STEP ))\"" >/dev/null 2>&1
+    # Restore through the init script: it knows the daemon's real
+    # arguments (-S /etc/ntpd_callback and the configured servers).
+    # Leaving a bench device without time sync is not an acceptable
+    # side effect of a test, so this is verified, not assumed.
+    if [ "$NTPD_WAS" = yes ]; then
+        ssh -o ConnectTimeout=8 "$SSH_TARGET" \
+            '[ -x /etc/init.d/S49ntpd ] && /etc/init.d/S49ntpd start >/dev/null 2>&1; exit 0' >/dev/null 2>&1
+        if ssh -o ConnectTimeout=8 "$SSH_TARGET" 'pgrep -x ntpd >/dev/null' 2>/dev/null; then
+            ok "wall-clock step: ntpd restored on the device"
+        else
+            bad "wall-clock step cleanup" "ntpd did not come back — device left without time sync"
+        fi
+    fi
+    CSJ=$(echo "$CS" | sed -n 's/^SUMMARY //p')
+    if [ -z "$CSJ" ]; then
+        bad "wall-clock step" "probe produced no summary: $(echo "$CS" | tail -1)"
+    else
+        CS_FRAMES=$(echo "$CSJ" | python3 -c 'import sys,json; print(json.load(sys.stdin)["frames"])')
+        CS_GAP=$(echo "$CSJ" | python3 -c 'import sys,json; print(json.load(sys.stdin)["max_rtp_gap_s"])')
+        CS_SR=$(echo "$CSJ" | python3 -c 'import sys,json; print(json.load(sys.stdin)["sr_ntp_step_s"])')
+        # A media clock must not inherit a wall-clock jump: the worst
+        # RTP advance across the step should still look like frames,
+        # not like two minutes.
+        if python3 -c "import sys; sys.exit(0 if float('$CS_GAP') < 5 else 1)"; then
+            ok "wall-clock step: RTP timeline unaffected (max gap ${CS_GAP}s over ${CS_FRAMES} frames)"
+        else
+            bad "wall-clock step: RTP timeline follows wall clock" \
+                "max RTP gap ${CS_GAP}s after a ${STEP}s step — receivers see a discontinuity"
+        fi
+        if python3 -c "import sys; sys.exit(0 if float('$CS_SR') > $STEP / 2 else 1)"; then
+            ok "wall-clock step: RTCP SR NTP followed the clock (${CS_SR}s)"
+        else
+            skip "RTCP SR NTP step not observed (${CS_SR}s; SR cadence may straddle the step)"
+        fi
+    fi
+elif [ "$CLOCKSTEP" = 1 ]; then
+    skip "wall-clock step (--ssh not given)"
+fi
 
 # ── 12. Producer restart (--producer-restart, needs --ssh): the ring
 #       producer dies and comes back under a live consumer. Every
