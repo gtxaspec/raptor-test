@@ -49,6 +49,7 @@ Options:
   --webrtc <whip-url>  WebRTC leg via rwd WHIP (H264 stream; needs webrtc-venv)
   --gop <frames>       assert the measured GOP interval equals this value
   --fuzz               throw malformed RTSP at the server, assert it survives
+  --cold               RHD cold-start snapshots (adds ~55s idle; needs --rhd)
   --json <file>        also write one JSON record per check (JSONL)
   --fps-tol <frac>     video fps tolerance vs nominal (default 0.15)
   --drift-ppm <n>      audio cadence drift ceiling in ppm (default 3000)
@@ -100,6 +101,7 @@ SOAK_MIN=""
 CORE=0
 JSON_FILE=""
 FUZZ=0
+COLD=0
 FPS_TOL=0.15
 DRIFT_PPM=3000
 BITRATE_TOL=0.35
@@ -117,6 +119,7 @@ while [ $# -gt 0 ]; do
     --gop) GOP_EXPECT=$2; shift 2 ;;
     --soak) SOAK_MIN=$2; shift 2 ;;
     --fuzz) FUZZ=1; shift ;;
+    --cold) COLD=1; shift ;;
     --json) JSON_FILE=$2; shift 2 ;;
     --fps-tol) FPS_TOL=$2; shift 2 ;;
     --drift-ppm) DRIFT_PPM=$2; shift 2 ;;
@@ -1236,6 +1239,22 @@ clip_verify() {
         ok "$name (v=${vdur}s a=${adur:-none}s, decode clean)"
     fi
 }
+
+# ── 8a. RHD cold-start snapshots (--rhd --cold): must run before any
+#       other JPEG traffic, since a viewer holds the encoder up and
+#       leaves no cold path to test ──
+if [ -n "$RHD_URL" ] && [ "$COLD" = 1 ]; then
+    timeout -k 5 180 python3 "$PROBES/rhd_cold.py" "$RHD_URL" \
+        ${RTSP_USER:+"$RTSP_USER" "$RTSP_PASS"} 25 >"$WORK/rhd_cold.txt" 2>&1
+    while IFS= read -r line; do
+        case $line in
+            OK\ *)   ok "${line#OK }" ;;
+            FAIL\ *) bad "${line#FAIL }" ;;
+        esac
+    done <"$WORK/rhd_cold.txt"
+elif [ -n "$RHD_URL" ]; then
+    skip "RHD cold-start snapshots (--cold not given)"
+fi
 
 # ── 8b. RHD HTTP endpoints: JPEG snapshot + MJPEG stream (--rhd) ──
 if [ -n "$RHD_URL" ]; then
