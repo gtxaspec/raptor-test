@@ -160,9 +160,21 @@ case "$HOSTPORT" in
     HOSTPORT=${HOSTPORT##*@}
     ;;
 esac
-HOST=${HOSTPORT%%:*}
-PORT=${HOSTPORT##*:}
-[ "$PORT" = "$HOST" ] && PORT=554
+# An IPv6 literal arrives bracketed ([fdfc::155]:554). HOST is kept
+# bare: the python probes hand it straight to the socket layer, and
+# rtsplib re-brackets it for request-URIs itself.
+case "$HOSTPORT" in
+\[*)
+    HOST=${HOSTPORT%%]*}; HOST=${HOST#\[}
+    PORT=${HOSTPORT##*]}; PORT=${PORT#:}
+    [ -n "$PORT" ] || PORT=554
+    ;;
+*)
+    HOST=${HOSTPORT%%:*}
+    PORT=${HOSTPORT##*:}
+    [ "$PORT" = "$HOST" ] && PORT=554
+    ;;
+esac
 RPATH=/${URL#rtsp://*/}
 
 # With --user/--pass, client legs (ffmpeg/mpv/go2rtc/frigate) get the

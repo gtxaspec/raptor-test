@@ -47,7 +47,10 @@ class RtspSession:
         self.port = int(port)
         self.path = path
         scheme = "rtsps" if tls else "rtsp"
-        self.url = f"{scheme}://{host}:{port}{path}"
+        # An IPv6 literal must be bracketed in the request-URI, and only
+        # there -- the socket call below wants it bare.
+        hostpart = f"[{host}]" if ":" in host else host
+        self.url = f"{scheme}://{hostpart}:{port}{path}"
         self.sock = socket.create_connection((host, self.port), timeout=timeout)
         if tls:
             # Cameras ship self-signed certs; the probe verifies the

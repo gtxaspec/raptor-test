@@ -292,7 +292,7 @@ battery_for_target() {
     fi
     # Reset every field so a sparse conf can't inherit the previous
     # target's values (matters for --all).
-    SOC=''; HOST=''; SSH=''; SRT=''; SRT_PASS=''; RHD=''; USER=''; PASS=''
+    SOC=''; HOST=''; HOST6=''; SSH=''; SRT=''; SRT_PASS=''; RHD=''; USER=''; PASS=''
     SIGN_PASS=''
     RTSP_PORT=554; PATH0=stream0; PATH1=stream1
     R555_PORT=''; R555_PATH0=stream0; R555_PATH1=stream1
@@ -441,6 +441,23 @@ battery_for_target() {
         CONF_SET=$saved_conf
     else
         printf '%s\t%s\tn/a\n' "$name" "signing (SEI + signed snapshots)" >>"$MATRIX_FILE"
+    fi
+
+    # Backend 5: IPv6. The lab is dual-stacked and the policy is
+    # v6-first, so the core suite must also pass against an IPv6
+    # literal, not just the v4 address every other pass dials. Same
+    # daemons as the rsd pass; what changes is the wire.
+    if [ -n "$HOST6" ]; then
+        local -a v6_args=(--core)
+        [ -n "$USER" ] && v6_args+=(--user "$USER" --pass "$PASS")
+        BRINGUP_LABEL="ipv6 (core suite over v6 literal)"
+        if bringup "$RTSP_PORT" "${base_set[@]}" $DAEMONS_RTSP; then
+            run_suite "ipv6 (core suite over v6 literal)" \
+                "rtsp://[$HOST6]:$RTSP_PORT/$PATH0" "${v6_args[@]}"
+        fi
+    else
+        printf '%s\t%s\tn/a (no HOST6 in target conf)\n' "$name" \
+            "ipv6 (core suite over v6 literal)" >>"$MATRIX_FILE"
     fi
 }
 
