@@ -123,13 +123,20 @@ bringup() {
             sed -i \"/^\\[\$sec\\]/,/^\\[/{/^\$key *=/d}\" '$CONFIG_PATH'
             sed -i \"/^\\[\$sec\\]/a \$key = \$val\" '$CONFIG_PATH'
         done
+        # Pre-fault every binary before the liveness clock starts: a
+        # cold binary demand-paged over NFS can stall in execve long
+        # enough to blow any reasonable budget, and until execve
+        # completes the process still carries the shell's name, so
+        # pidof cannot see it. The stall also bills whichever daemon
+        # started last, not whichever binary was cold.
+        for d in$ordered; do cat '$DAEMON_BIN'/\$d >/dev/null 2>&1; done
+        cat '$DAEMON_BIN'/ringdump >/dev/null 2>&1
         for d in$ordered; do
             [ -x '$DAEMON_BIN'/\$d ] || { echo \"MISSING \$d\"; exit 1; }
             nohup '$DAEMON_BIN'/\$d >/tmp/\$d.log 2>&1 </dev/null &
             # RVD/RFS bring the pipeline up before they fork. Consumers
-            # are quick once resident, but a cold static binary demand-
-            # paged over NFS while RVD initializes can take >10s to
-            # exec, and the last daemon in line pays the most.
+            # are quick once resident, but exec of a big static binary
+            # is not free even warm.
             tries=80; case \$d in rvd|rfs) tries=120 ;; esac
             for i in \$(seq \$tries); do pidof \$d >/dev/null && break; sleep 0.25; done
             # A daemon whose feature is off in raptor.conf logs and
