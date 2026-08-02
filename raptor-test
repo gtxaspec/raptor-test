@@ -1240,6 +1240,17 @@ clip_verify() {
     fi
 }
 
+# ── 7b. Slow-client smoke: readers that never keep up must not stall
+#       or wound the server ──
+SLOWRPT=$(timeout -k 5 90 python3 "$PROBES/slow_client.py" "$HOST" "$PORT" "$RPATH" \
+    "${RTSP_USER:-}" "${RTSP_PASS:-}" "${RHD_URL:--}" 12 2>&1)
+while IFS= read -r line; do
+    case $line in
+        OK\ *)   ok "${line#OK }" ;;
+        FAIL\ *) bad "${line#FAIL }" ;;
+    esac
+done <<<"$SLOWRPT"
+
 # ── 8a. RHD cold-start snapshots (--rhd --cold): must run before any
 #       other JPEG traffic, since a viewer holds the encoder up and
 #       leaves no cold path to test ──

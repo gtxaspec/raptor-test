@@ -243,7 +243,7 @@ battery_for_target() {
     fi
     # Reset every field so a sparse conf can't inherit the previous
     # target's values (matters for --all).
-    SOC=''; HOST=''; SSH=''; SRT=''; RHD=''; USER=''; PASS=''
+    SOC=''; HOST=''; SSH=''; SRT=''; SRT_PASS=''; RHD=''; USER=''; PASS=''
     RTSP_PORT=554; PATH0=stream0; PATH1=stream1
     R555_PORT=''; R555_PATH0=stream0; R555_PATH1=stream1
     GO2RTC=''; FRIGATE=no; RECORD_CHECK=''; NOTES=''; GOP=''
@@ -296,6 +296,8 @@ battery_for_target() {
     # legs (SRT, TLS, RTMP) since it is always present.
     local -a rsd_args=("${common[@]}")
     [ -n "$SRT" ]  && rsd_args+=(--srt "$SRT")
+    [ -n "$SRT_PASS" ] && rsd_args+=(--srt-passphrase "$SRT_PASS")
+    [ -n "$RHD" ]  && rsd_args+=(--cold)
     [ -n "$TLS" ]  && rsd_args+=(--tls "$TLS")
     [ -n "$RTMP" ] && rsd_args+=(--rtmp "$RTMP")
     [ -n "$WEBRTC" ] && rsd_args+=(--webrtc "$WEBRTC")

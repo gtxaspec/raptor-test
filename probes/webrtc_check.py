@@ -99,6 +99,9 @@ async def run():
                 await pc.close()
                 return
             answer_sdp = await resp.text()
+            # WHIP resource URL: the session handle a client uses to
+            # release the PeerConnection (draft-ietf-wish-whip 4.2).
+            resource = resp.headers.get("Location", "")
 
     # A well-formed answer carries the DTLS fingerprint and ICE creds.
     emit("a=fingerprint" in answer_sdp and "a=ice-ufrag" in answer_sdp,
@@ -123,6 +126,8 @@ async def run():
              "WebRTC talk-back negotiated (server accepts client audio)",
              f"answer audio direction: {a_dir}")
 
+    emit(bool(resource), "WHIP answer carries a Location resource URL", resource or "no Location header")
+
     await pc.setRemoteDescription(RTCSessionDescription(sdp=answer_sdp, type="answer"))
 
     # Collect frames for `duration`.
@@ -131,6 +136,22 @@ async def run():
     except asyncio.TimeoutError:
         pass
     await pc.close()
+
+    # DELETE on the resource is how a client says it is done
+    # (draft-ietf-wish-whip 4.2). A server that does not honour it
+    # leaks the PeerConnection until some other timeout fires, which
+    # on a 4-client camera is a denied slot for the next viewer.
+    if resource:
+        durl = resource if "://" in resource else \
+            whip_url.split("/", 3)[0] + "//" + whip_url.split("/", 3)[2] + resource
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.delete(durl, headers={k: v for k, v in headers.items()
+                                                   if k != "Content-Type"}, ssl=False) as dr:
+                    emit(dr.status in (200, 204, 404),
+                         "WHIP DELETE releases the session", f"HTTP {dr.status}")
+        except Exception as e:
+            emit(False, "WHIP DELETE releases the session", f"{type(e).__name__}: {e}")
 
     # Audio: identify the negotiated codec from the answer and confirm
     # it decoded to real samples. rwd transcodes the ring AAC to Opus
