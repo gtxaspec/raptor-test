@@ -134,7 +134,7 @@ bringup() {
         for d in$ordered; do
             [ -x '$DAEMON_BIN'/\$d ] || { echo \"MISSING \$d\"; exit 1; }
             nohup '$DAEMON_BIN'/\$d >/tmp/\$d.log 2>&1 </dev/null &
-            launcher=\$!
+            launcher=\$!; found=0
             # Wait on the launcher, not on a stopwatch. Until execve
             # completes the process still carries the shell's name, so
             # pidof cannot see a start that is genuinely in progress --
@@ -154,7 +154,17 @@ bringup() {
             # failure. The line lands in syslog rather than the capture
             # file when the daemon has already forked, so check both.
             # Anything else that is not running is a real failure.
+            # One pidof scan is not proof of death: it has been seen to
+            # miss a daemon that is demonstrably running and streaming
+            # while the device is busy. Re-verify, and consult /proc
+            # directly, before condemning it.
             if ! pidof \$d >/dev/null; then
+                sleep 2
+                for pd in /proc/[0-9]*; do
+                    [ \"\$(cat \$pd/comm 2>/dev/null)\" = \"\$d\" ] && { found=1; break; }
+                done
+            fi
+            if ! pidof \$d >/dev/null && [ \"\${found:-0}\" != 1 ]; then
                 if grep -q 'disabled in config' /tmp/\$d.log 2>/dev/null ||
                    logread 2>/dev/null | tail -80 | grep -q \"\$d.*disabled in config\"; then
                     echo \"  (\$d disabled in config)\"
