@@ -134,11 +134,21 @@ bringup() {
         for d in$ordered; do
             [ -x '$DAEMON_BIN'/\$d ] || { echo \"MISSING \$d\"; exit 1; }
             nohup '$DAEMON_BIN'/\$d >/tmp/\$d.log 2>&1 </dev/null &
-            # RVD/RFS bring the pipeline up before they fork. Consumers
-            # are quick once resident, but exec of a big static binary
-            # is not free even warm.
-            tries=80; case \$d in rvd|rfs) tries=120 ;; esac
-            for i in \$(seq \$tries); do pidof \$d >/dev/null && break; sleep 0.25; done
+            launcher=\$!
+            # Wait on the launcher, not on a stopwatch. Until execve
+            # completes the process still carries the shell's name, so
+            # pidof cannot see a start that is genuinely in progress --
+            # and on a 64MB device the pages of a big static binary get
+            # evicted while RVD builds its pipeline, so that exec can
+            # take tens of seconds off NFS no matter how warm the cache
+            # was. While the launcher pid is alive the start has not
+            # failed; the cap is only a backstop against a true hang.
+            tries=240; case \$d in rvd|rfs) tries=360 ;; esac
+            for i in \$(seq \$tries); do
+                pidof \$d >/dev/null && break
+                kill -0 \$launcher 2>/dev/null || break
+                sleep 0.25
+            done
             # A daemon whose feature is off in raptor.conf logs and
             # exits by design; that is a legitimate shape, not a
             # failure. The line lands in syslog rather than the capture
@@ -244,6 +254,7 @@ battery_for_target() {
     # Reset every field so a sparse conf can't inherit the previous
     # target's values (matters for --all).
     SOC=''; HOST=''; SSH=''; SRT=''; SRT_PASS=''; RHD=''; USER=''; PASS=''
+    SIGN_PASS=''
     RTSP_PORT=554; PATH0=stream0; PATH1=stream1
     R555_PORT=''; R555_PATH0=stream0; R555_PATH1=stream1
     GO2RTC=''; FRIGATE=no; RECORD_CHECK=''; NOTES=''; GOP=''
@@ -331,6 +342,34 @@ battery_for_target() {
             --sub "rtsp://$HOST:$R555_PORT/$R555_PATH1" "${r555_args[@]}"
     else
         printf '%s\t%s\tn/a\n' "$name" "rsd-555 (live555 RTSP)" >>"$MATRIX_FILE"
+    fi
+
+    # Backend 3: signing. Every pass above runs with sei_timecode and
+    # sign_snapshots off, which is how they ship, so the SEI check
+    # skips and no signed artifact is ever produced -- the provenance
+    # path is the one feature the battery cannot see. Signing rewrites
+    # what a decoder receives (per-frame SEI in the elementary stream,
+    # an APP segment in the JPEG), so "still decodes" is the assertion
+    # that matters. Core subset plus RHD: this is about the artifacts,
+    # not another full protocol sweep.
+    if [ -n "$SIGN_PASS" ] && [ -n "$DAEMONS_BASE" ]; then
+        local -a sign_args=(--core)
+        [ -n "$SSH" ]  && sign_args+=(--ssh "$SSH")
+        [ -n "$USER" ] && sign_args+=(--user "$USER" --pass "$PASS")
+        [ -n "$RHD" ]  && sign_args+=(--rhd "$RHD")
+        BRINGUP_LABEL="signing (SEI + signed snapshots)"
+        local saved_conf=$CONF_SET
+        CONF_SET="$CONF_SET rtsp.sei_timecode=true http.sign_snapshots=true"
+        local -a ps=("${base_set[@]}" $DAEMONS_RTSP)
+        [ -n "$RHD" ] && ps+=($DAEMONS_RHD)
+        if bringup "$RTSP_PORT" "${ps[@]}"; then
+            run_suite "signing (SEI + signed snapshots)" \
+                "rtsp://$HOST:$RTSP_PORT/$PATH0" \
+                --sub "rtsp://$HOST:$RTSP_PORT/$PATH1" "${sign_args[@]}"
+        fi
+        CONF_SET=$saved_conf
+    else
+        printf '%s\t%s\tn/a\n' "$name" "signing (SEI + signed snapshots)" >>"$MATRIX_FILE"
     fi
 }
 

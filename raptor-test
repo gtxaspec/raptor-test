@@ -1771,6 +1771,18 @@ fi
 if [ -n "$WEBRTC_URL" ]; then
     WVENV="$DIR/tools/webrtc-venv/bin/python"
     if [ -x "$WVENV" ]; then
+        # Watch for the speaker ring while the session is up. Sampling
+        # after the probe exits only worked while the probe leaked the
+        # session: releasing it properly closes the ring, so the
+        # evidence is gone by then. "Did it ever appear" is the real
+        # question and does not depend on cleanup timing.
+        SPKF="$WORK/speaker.txt"
+        if [ -n "$SSH_TARGET" ]; then
+            ( ssh -o ConnectTimeout=8 "$SSH_TARGET" \
+                'for i in $(seq 90); do [ -e /dev/shm/rss_ring_speaker ] && { echo seen; exit 0; }; sleep 0.5; done; echo missing' \
+                >"$SPKF" 2>/dev/null ) &
+            SPKPID=$!
+        fi
         WRTC=$(timeout -k 5 45 "$WVENV" "$PROBES/webrtc_check.py" "$WEBRTC_URL" \
             "${RTSP_USER:-}" "${RTSP_PASS:-}" 12 0 1 2>&1)
         echo "$WRTC" >"$WORK/webrtc.txt"
@@ -1784,11 +1796,14 @@ if [ -n "$WEBRTC_URL" ]; then
         # Talk-back evidence on the device: rwd writes received client
         # audio into the speaker ring.
         if [ -n "$SSH_TARGET" ] && echo "$WRTC" | grep -q "OK WebRTC talk-back"; then
-            if ssh -o ConnectTimeout=8 "$SSH_TARGET" 'test -e /dev/shm/rss_ring_speaker' 2>/dev/null; then
+            [ -n "${SPKPID:-}" ] && wait "$SPKPID" 2>/dev/null
+            if grep -q seen "$SPKF" 2>/dev/null; then
                 ok "WebRTC talk-back audio landed (speaker ring on device)"
             else
-                bad "WebRTC talk-back device evidence" "/dev/shm/rss_ring_speaker missing"
+                bad "WebRTC talk-back device evidence" "/dev/shm/rss_ring_speaker never appeared"
             fi
+        elif [ -n "${SPKPID:-}" ]; then
+            wait "$SPKPID" 2>/dev/null
         fi
     else
         skip "WebRTC leg (tools/webrtc-venv missing — run tools/fetch-tools.sh)"
