@@ -126,9 +126,11 @@ bringup() {
         for d in$ordered; do
             [ -x '$DAEMON_BIN'/\$d ] || { echo \"MISSING \$d\"; exit 1; }
             nohup '$DAEMON_BIN'/\$d >/tmp/\$d.log 2>&1 </dev/null &
-            # RVD/RFS bring the pipeline up before they fork; consumers
-            # are quick. Budget accordingly.
-            tries=40; case \$d in rvd|rfs) tries=120 ;; esac
+            # RVD/RFS bring the pipeline up before they fork. Consumers
+            # are quick once resident, but a cold static binary demand-
+            # paged over NFS while RVD initializes can take >10s to
+            # exec, and the last daemon in line pays the most.
+            tries=80; case \$d in rvd|rfs) tries=120 ;; esac
             for i in \$(seq \$tries); do pidof \$d >/dev/null && break; sleep 0.25; done
             # A daemon whose feature is off in raptor.conf logs and
             # exits by design; that is a legitimate shape, not a
