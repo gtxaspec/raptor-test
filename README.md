@@ -14,9 +14,13 @@ test once missed the bug it now catches.
 ## Running the whole battery on a target
 
 `raptor-test` checks one endpoint per invocation. To run the *entire*
-battery — every backend (rsd, rsd-555, SRT, RTMP, WebRTC, RHD) and
-every leg — the same way on every device, use `run-battery` with a
-target manifest so coverage can't drift between targets:
+battery — every backend (rsd, rsd-555, SRT, RTMP, WebRTC, RHD), the
+H.265, signing and IPv6 passes, and every leg — the same way on every
+device, use `run-battery` with a target manifest so coverage can't
+drift between targets. The IPv6 pass dials the core suite at the
+literal in `HOST6=` (the policy is v6-first, so v6 is asserted, not
+assumed); targets without `HOST6` report it as n/a rather than
+silently shrinking coverage:
 
 ```sh
 ./run-battery t23-cinnado      # one target, all its backends
