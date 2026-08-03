@@ -16,6 +16,7 @@ timestamp gaps and SR NTP movement; the caller asserts on them.
 """
 import json
 import sys
+import time
 
 from rtsplib import RtspSession, parse_rtp, parse_sr
 

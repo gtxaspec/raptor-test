@@ -289,6 +289,42 @@ if [ "$CLOCKSTEP" = 1 ] && [ -n "$SSH_TARGET" ]; then
     CS=$(timeout -k 5 60 python3 "$PROBES/clock_step.py" "$HOST" "$PORT" "$RPATH" \
         "${RTSP_USER:-}" "${RTSP_PASS:-}" 20 2>&1)
     wait $STEPPER 2>/dev/null
+    # Re-anchor check, while the clock is still stepped: the mapping
+    # stability asserted mid-session must not outlive the sessions it
+    # protects. It needs the server genuinely idle -- earlier legs'
+    # UDP sessions linger until the RTSP timeout reaps them, and any
+    # live RTCP instance legitimately holds the anchor -- so wait for
+    # the server's own client count to hit zero before dialing in.
+    CS_REARM=""
+    IDLE=no
+    for _ in $(seq 30); do
+        if ssh -o ConnectTimeout=8 "$SSH_TARGET" 'raptorctl rsd status 2>/dev/null' \
+            | grep -q '"clients":0'; then IDLE=yes; break; fi
+        sleep 3
+    done
+    if [ "$IDLE" = yes ]; then
+        CS_REARM=$(python3 - "$HOST" "$PORT" "$RPATH" "${RTSP_USER:-}" "${RTSP_PASS:-}" <<'REARM_EOF'
+import sys, time
+sys.path.insert(0, "probes")
+from rtsplib import RtspSession, parse_sr
+host, port, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+user = sys.argv[4] or None
+pw = sys.argv[5] or None
+try:
+    s = RtspSession(host, port, path, user=user, password=pw)
+    s.describe(); s.setup("video", 0); s.play()
+    for t, ch, pkt in s.packets(8.0):
+        if ch == 1:
+            sr = parse_sr(pkt)
+            if sr:
+                print(round(sr[0] - 2208988800 - time.time(), 1))
+                break
+    s.close()
+except OSError:
+    pass
+REARM_EOF
+)
+    fi
     # Always put the clock back and restore ntpd, whatever happened.
     ssh -o ConnectTimeout=8 "$SSH_TARGET" "date -s \"@\$(( \$(date +%s) - $STEP ))\"" >/dev/null 2>&1
     # Restore through the init script: it knows the daemon's real
@@ -336,6 +372,19 @@ if [ "$CLOCKSTEP" = 1 ] && [ -n "$SSH_TARGET" ]; then
         else
             bad "wall-clock step: SR NTP moved by ${CS_SR}s" \
                 "neither wallclock-tracking (~${STEP}s) nor mapping-stable (~0s)"
+        fi
+        # A fresh session anchors on the current clock, so one reconnect
+        # after a step carries correct wallclock (the boot-order case:
+        # cameras that stream before NTP first syncs).
+        if [ "$IDLE" != yes ]; then
+            skip "wall-clock step: re-anchor check (server never went idle -- lingering sessions hold the anchor legitimately)"
+        elif [ -z "$CS_REARM" ]; then
+            bad "wall-clock step: re-anchor check" "fresh session produced no SR within 8s"
+        elif python3 -c "import sys; v=float('$CS_REARM'); sys.exit(0 if $STEP - 30 <= v <= $STEP + 30 else 1)"; then
+            ok "wall-clock step: fresh session re-anchored on the stepped clock (+${CS_REARM}s)"
+        else
+            bad "wall-clock step: fresh session did not re-anchor" \
+                "SR offset ${CS_REARM}s vs the ${STEP}s step — anchor survived a session drop"
         fi
     fi
 elif [ "$CLOCKSTEP" = 1 ]; then
