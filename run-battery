@@ -459,6 +459,61 @@ battery_for_target() {
         printf '%s\t%s\tn/a (no HOST6 in target conf)\n' "$name" \
             "ipv6 (core suite over v6 literal)" >>"$MATRIX_FILE"
     fi
+
+    # Backend 6: SR wall-clock mapping. rlatency maps RTP timestamps to
+    # NTP via the Sender Reports and compares against this host's clock.
+    # With a synced camera the p50 sits within a few ms (network flight
+    # plus residual clock offset), so the budget is 25ms. This is the
+    # leg for anchor-class bugs: a sub-second truncation in compy's
+    # mono-to-NTP offset read a steady -519ms here while every in-band
+    # check stayed green, because both tracks shared the bias. A p50
+    # beyond a second is the camera's clock, not raptor, and reports
+    # n/a. Auth is cleared for the pass (rlatency speaks plain RTSP);
+    # the device conf is restored from backup afterwards, and runs last
+    # so the running daemons carry the cleared conf only until the next
+    # bring-up.
+    local rlat="$DIR/tools/rlatency"
+    local rlat_src="$DIR/../raptor/rlatency/rlatency.c"
+    if [ -f "$rlat_src" ] && { [ ! -x "$rlat" ] || [ "$rlat_src" -nt "$rlat" ]; }; then
+        cc -O2 -o "$rlat" "$rlat_src" -lm 2>/dev/null || true
+    fi
+    if [ -x "$rlat" ] && [ -n "$DAEMONS_BASE" ] && [ -n "$SSH" ]; then
+        BRINGUP_LABEL="sr-wallclock (rlatency)"
+        local saved_conf=$CONF_SET
+        CONF_SET="$CONF_SET rtsp.username= rtsp.password="
+        ssh -o ConnectTimeout=10 "$SSH" "cp '$CONFIG_PATH' '$CONFIG_PATH.srwall-bak'"
+        if bringup "$RTSP_PORT" "${base_set[@]}" $DAEMONS_RTSP; then
+            echo
+            echo "################################################################"
+            echo "# sr-wallclock (rlatency)"
+            echo "#   rtsp://$HOST:$RTSP_PORT/$PATH0 -n 200"
+            echo "################################################################"
+            local rlat_out p50 verdict
+            rlat_out=$(timeout 60 "$rlat" "rtsp://$HOST:$RTSP_PORT/$PATH0" -n 200 -q 2>&1)
+            echo "$rlat_out" | tail -9
+            p50=$(echo "$rlat_out" | sed -n 's/.*P50: *\(-*[0-9.]*\) ms.*/\1/p')
+            if [ -z "$p50" ]; then
+                verdict="FAIL (no samples: $(echo "$rlat_out" | tail -1))"
+                OVERALL_FAIL=1
+            else
+                verdict=$(awk -v p="$p50" 'BEGIN {
+                    a = p < 0 ? -p : p
+                    if (a <= 25) print "PASS (p50=" p "ms)"
+                    else if (a > 1000)
+                        print "n/a (host-camera clocks unsynced: p50=" p "ms)"
+                    else print "FAIL (SR anchor off by " p "ms)"
+                }')
+                case "$verdict" in FAIL*) OVERALL_FAIL=1 ;; esac
+            fi
+            printf '%s\t%s\t%s\n' "$name" "sr-wallclock (rlatency)" "$verdict" \
+                >>"$MATRIX_FILE"
+        fi
+        ssh -o ConnectTimeout=10 "$SSH" "mv '$CONFIG_PATH.srwall-bak' '$CONFIG_PATH'" || true
+        CONF_SET=$saved_conf
+    else
+        printf '%s\t%s\tn/a (rlatency tool or ssh unavailable)\n' "$name" \
+            "sr-wallclock (rlatency)" >>"$MATRIX_FILE"
+    fi
 }
 
 if [ "$1" = "--all" ]; then

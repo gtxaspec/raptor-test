@@ -20,7 +20,10 @@ device, use `run-battery` with a target manifest so coverage can't
 drift between targets. The IPv6 pass dials the core suite at the
 literal in `HOST6=` (the policy is v6-first, so v6 is asserted, not
 assumed); targets without `HOST6` report it as n/a rather than
-silently shrinking coverage:
+silently shrinking coverage. A final sr-wallclock pass maps SR NTP
+against this host's clock with `rlatency` (built on demand from the
+raptor sibling) and holds the p50 to 25ms — the anchor-class check
+that caught a steady -519ms bias every in-band leg was blind to:
 
 ```sh
 ./run-battery t23-cinnado      # one target, all its backends

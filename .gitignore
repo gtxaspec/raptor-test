@@ -4,6 +4,7 @@ raptor-test-logs/
 tools/ffmpeg
 tools/ffprobe
 tools/openRTSP
+tools/rlatency
 tools/live555MediaServer
 tools/webrtc-venv/
 .ruff_cache/
