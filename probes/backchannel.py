@@ -116,8 +116,10 @@ def main():
     print(f"BC_SENT={sent}", flush=True)
 
     # Hold the session so the caller can verify device-side evidence
-    # (rsd destroys the speaker ring at teardown by design).
-    time.sleep(2.5)
+    # (rsd destroys the speaker ring at teardown by design). Long
+    # enough for a loaded single-core unit to process the packets and
+    # for the caller to poll over ssh.
+    time.sleep(6.0)
 
     st, _, _ = s.request("GET_PARAMETER")
     print(f"BC_ALIVE={'yes' if '200' in st else code(st)}")

@@ -1542,8 +1542,17 @@ if [ -n "$SSH_TARGET" ]; then
         sleep 0.5
     done
     if grep -q 'BC_SENT=' "$WORK/backchannel.txt" 2>/dev/null; then
-        ssh -o ConnectTimeout=5 "$SSH_TARGET" 'test -e /dev/shm/rss_ring_speaker' 2>/dev/null \
-            && BCRING="yes" || BCRING="no"
+        # Poll across the probe's hold: on a loaded unit the ring can
+        # trail the send by a while (receive thread contention), and a
+        # single ssh round trip can eat the whole window.
+        BCRING="no"
+        for i in $(seq 1 10); do
+            if ssh -o ConnectTimeout=5 "$SSH_TARGET" 'test -e /dev/shm/rss_ring_speaker' 2>/dev/null; then
+                BCRING="yes"; break
+            fi
+            kill -0 $BCPID 2>/dev/null || break
+            sleep 0.5
+        done
     fi
 fi
 wait $BCPID 2>/dev/null
