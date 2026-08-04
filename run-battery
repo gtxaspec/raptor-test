@@ -80,7 +80,7 @@ bringup() {
     if ! want_backend "${BRINGUP_LABEL:-}"; then
         printf '%s\t%s\tskipped (--backend %s)\n' "$CURRENT_TARGET" \
             "${BRINGUP_LABEL:-?}" "$ONLY_BACKEND" >>"$MATRIX_FILE"
-        return 1
+        return 3
     fi
     [ -n "$DAEMONS_BASE" ] || return 0
     if [ -z "$SSH" ] || [ -z "$DAEMON_BIN" ]; then
@@ -392,10 +392,15 @@ battery_for_target() {
     [ -n "$RHD" ]    && p1+=($DAEMONS_RHD)
     [ -n "$WEBRTC" ] && p1+=($DAEMONS_WEBRTC)
     [ -n "$RTMP" ]   && p1+=($DAEMONS_RTMP)
-    bringup "$RTSP_PORT" "${p1[@]}" || return
-    run_suite "rsd (compy RTSP)" \
-        "rtsp://$HOST:$RTSP_PORT/$PATH0" \
-        --sub "rtsp://$HOST:$RTSP_PORT/$PATH1" "${rsd_args[@]}"
+    local brc=0
+    bringup "$RTSP_PORT" "${p1[@]}" || brc=$?
+    if [ "$brc" -eq 0 ]; then
+        run_suite "rsd (compy RTSP)" \
+            "rtsp://$HOST:$RTSP_PORT/$PATH0" \
+            --sub "rtsp://$HOST:$RTSP_PORT/$PATH1" "${rsd_args[@]}"
+    elif [ "$brc" -ne 3 ]; then
+        return
+    fi
 
     # Backend 2: rsd-555 (live555), if exposed. Reuse the common legs
     # minus SRT/RHD (those are backend-independent, covered above).
@@ -406,10 +411,15 @@ battery_for_target() {
         [ -n "$GO2RTC" ]     && r555_args+=(--go2rtc "$GO2RTC")
         [ "$FRIGATE" = yes ] && r555_args+=(--frigate)
         BRINGUP_LABEL="rsd-555 (live555 RTSP)"
-        bringup "$R555_PORT" "${base_set[@]}" $DAEMONS_R555 || return
-        run_suite "rsd-555 (live555 RTSP)" \
-            "rtsp://$HOST:$R555_PORT/$R555_PATH0" \
-            --sub "rtsp://$HOST:$R555_PORT/$R555_PATH1" "${r555_args[@]}"
+        brc=0
+        bringup "$R555_PORT" "${base_set[@]}" $DAEMONS_R555 || brc=$?
+        if [ "$brc" -eq 0 ]; then
+            run_suite "rsd-555 (live555 RTSP)" \
+                "rtsp://$HOST:$R555_PORT/$R555_PATH0" \
+                --sub "rtsp://$HOST:$R555_PORT/$R555_PATH1" "${r555_args[@]}"
+        elif [ "$brc" -ne 3 ]; then
+            return
+        fi
     else
         printf '%s\t%s\tn/a\n' "$name" "rsd-555 (live555 RTSP)" >>"$MATRIX_FILE"
     fi
