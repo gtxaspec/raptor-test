@@ -111,26 +111,34 @@ class RtspSession:
         # read) leaves non-status bytes at the front; resync onto the
         # next real status line instead of misreading a header as one.
         if not buf.startswith(b"RTSP/1.0 "):
-            for _ in range(32):
-                m = buf.find(b"RTSP/1.0 ")
-                if m >= 0:
-                    buf = buf[m:]
-                    break
-                try:
-                    d = self.sock.recv(4096)
-                except OSError:
-                    break
-                if not d:
-                    break
-                buf += d
-            while buf.startswith(b"RTSP/1.0 ") and b"\r\n\r\n" not in buf:
-                try:
-                    d = self.sock.recv(4096)
-                except OSError:
-                    break
-                if not d:
-                    break
-                buf += d
+            import sys as _sys
+            print("rtsplib: desync before %s response, head=%r" % (method, buf[:120]),
+                  file=_sys.stderr, flush=True)
+            prev_to = self.sock.gettimeout()
+            self.sock.settimeout(3.0)
+            try:
+                for _ in range(32):
+                    m = buf.find(b"RTSP/1.0 ")
+                    if m >= 0:
+                        buf = buf[m:]
+                        break
+                    try:
+                        d = self.sock.recv(4096)
+                    except OSError:
+                        break
+                    if not d:
+                        break
+                    buf += d
+                while buf.startswith(b"RTSP/1.0 ") and b"\r\n\r\n" not in buf:
+                    try:
+                        d = self.sock.recv(4096)
+                    except OSError:
+                        break
+                    if not d:
+                        break
+                    buf += d
+            finally:
+                self.sock.settimeout(prev_to)
         head, rest = buf.split(b"\r\n\r\n", 1)
         lines = head.decode(errors="replace").split("\r\n")
         headers = {}
