@@ -111,14 +111,26 @@ class RtspSession:
         # read) leaves non-status bytes at the front; resync onto the
         # next real status line instead of misreading a header as one.
         if not buf.startswith(b"RTSP/1.0 "):
-            m = buf.find(b"RTSP/1.0 ")
-            if m >= 0:
-                buf = buf[m:]
-                while b"\r\n\r\n" not in buf:
+            for _ in range(32):
+                m = buf.find(b"RTSP/1.0 ")
+                if m >= 0:
+                    buf = buf[m:]
+                    break
+                try:
                     d = self.sock.recv(4096)
-                    if not d:
-                        break
-                    buf += d
+                except OSError:
+                    break
+                if not d:
+                    break
+                buf += d
+            while buf.startswith(b"RTSP/1.0 ") and b"\r\n\r\n" not in buf:
+                try:
+                    d = self.sock.recv(4096)
+                except OSError:
+                    break
+                if not d:
+                    break
+                buf += d
         head, rest = buf.split(b"\r\n\r\n", 1)
         lines = head.decode(errors="replace").split("\r\n")
         headers = {}
