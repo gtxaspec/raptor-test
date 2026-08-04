@@ -8,6 +8,7 @@
 # between devices.
 #
 #   ./run-battery <target>        one target, all its backends
+#   ./run-battery <target> --backend <substr>   only matching pass(es)
 #   ./run-battery --all           every targets/*.conf, then a matrix
 #   ./run-battery --list          list defined targets
 #
@@ -39,6 +40,18 @@ case "$1" in
     --list) list_targets; exit 0 ;;
 esac
 
+# --backend <substr>: run only the pass(es) whose matrix label matches.
+# Everything else is recorded as skipped, so the matrix stays complete.
+ONLY_BACKEND=""
+if [ "$2" = "--backend" ] && [ -n "$3" ]; then
+    ONLY_BACKEND=$3
+fi
+
+want_backend() {
+    [ -z "$ONLY_BACKEND" ] && return 0
+    case "$1" in *"$ONLY_BACKEND"*) return 0 ;; *) return 1 ;; esac
+}
+
 # Canonical start order: the ring producer first (it creates the rings
 # every consumer opens), then audio, then the service daemons, then the
 # stream backends. Also the kill list.
@@ -64,6 +77,11 @@ section_for() {
 bringup() {
     local wait_port=$1
     shift
+    if ! want_backend "${BRINGUP_LABEL:-}"; then
+        printf '%s\t%s\tskipped (--backend %s)\n' "$CURRENT_TARGET" \
+            "${BRINGUP_LABEL:-?}" "$ONLY_BACKEND" >>"$MATRIX_FILE"
+        return 1
+    fi
     [ -n "$DAEMONS_BASE" ] || return 0
     if [ -z "$SSH" ] || [ -z "$DAEMON_BIN" ]; then
         echo "  BRING-UP SKIPPED: DAEMONS_BASE set but SSH=/DAEMON_BIN= missing" >&2
