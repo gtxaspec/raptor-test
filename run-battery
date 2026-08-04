@@ -177,12 +177,21 @@ bringup() {
             # miss a daemon that is demonstrably running and streaming
             # while the device is busy. Re-verify, and consult /proc
             # directly, before condemning it.
-            if ! pidof \$d >/dev/null; then
-                sleep 2
+            # Retry existence (not readiness) for up to 20s: pidof and
+            # a single /proc sweep have both missed live daemons under
+            # load, and a slow HAL init behind rvd's ISP re-init keeps
+            # the process valid the whole time. A crashed daemon stays
+            # absent, so the longer window cannot mask a real failure.
+            tries=0
+            while [ \$tries -lt 10 ]; do
+                pidof \$d >/dev/null && { found=1; break; }
                 for pd in /proc/[0-9]*; do
                     [ \"\$(cat \$pd/comm 2>/dev/null)\" = \"\$d\" ] && { found=1; break; }
                 done
-            fi
+                [ \"\${found:-0}\" = 1 ] && break
+                tries=\$((tries+1))
+                sleep 2
+            done
             if ! pidof \$d >/dev/null && [ \"\${found:-0}\" != 1 ]; then
                 if grep -q 'disabled in config' /tmp/\$d.log 2>/dev/null ||
                    logread 2>/dev/null | tail -80 | grep -q \"\$d.*disabled in config\"; then
