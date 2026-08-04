@@ -112,14 +112,22 @@ def main():
             break
         seq += 1
         ts += 160
-        time.sleep(0.018)
+        # Drain the media the session streams at us while we send: an
+        # unread connection backs live555 into EWOULDBLOCK mid-frame
+        # and it splices the interleaved stream (wire corruption a
+        # real consuming client never sees).
+        for _pkt in s.packets(0.018):
+            pass
     print(f"BC_SENT={sent}", flush=True)
 
     # Hold the session so the caller can verify device-side evidence
     # (rsd destroys the speaker ring at teardown by design). Long
     # enough for a loaded single-core unit to process the packets and
     # for the caller to poll over ssh.
-    time.sleep(6.0)
+    deadline = time.time() + 6.0
+    while time.time() < deadline:
+        for _pkt in s.packets(0.5):
+            pass
 
     st, _, _ = s.request("GET_PARAMETER")
     print(f"BC_ALIVE={'yes' if '200' in st else code(st)}")

@@ -90,57 +90,53 @@ class RtspSession:
         self.sock.sendall(msg.encode())
         buf = self.leftover
         self.leftover = b""
-        # Interleaved $-frames may arrive between request and response;
-        # skip them while hunting for the RTSP header block.
+
+        # Read the response as an ordered stream: interleaved $-frames
+        # can arrive before OR inside a short-written response, so
+        # deframe strictly from the front and accumulate head text
+        # around them. The terminator is only ever searched in the
+        # accumulated text, never in frame payloads (RTCP binary can
+        # contain CRLFCRLF bytes, and a whole-buffer scan then splits
+        # the head mid-frame -- seen against rsd-555 under load).
+        head_txt = b""
+        rest = b""
         while True:
-            while buf[:1] == b"$":
-                if len(buf) < 4:
-                    buf += self.sock.recv(4096)
-                    continue
+            if len(buf) < 2:
+                d = self.sock.recv(4096)
+                if not d:
+                    return "", {}, ""
+                buf += d
+                continue
+            if buf[:1] == b"$" and buf[1] <= 30:
+                while len(buf) < 4:
+                    d = self.sock.recv(4096)
+                    if not d:
+                        return "", {}, ""
+                    buf += d
                 ln = struct.unpack(">H", buf[2:4])[0]
                 while len(buf) < 4 + ln:
-                    buf += self.sock.recv(65536)
+                    d = self.sock.recv(65536)
+                    if not d:
+                        return "", {}, ""
+                    buf += d
                 buf = buf[4 + ln:]
-            if b"\r\n\r\n" in buf:
+                continue
+            # Consume text up to the next possible frame start; keep a
+            # trailing "$" in buf until its follow-up byte arrives.
+            m = buf.find(b"$", 1)
+            if m < 0:
+                head_txt += buf
+                buf = b""
+            else:
+                head_txt += buf[:m]
+                buf = buf[m:]
+            if b"\r\n\r\n" in head_txt:
+                head_txt, _, extra_txt = head_txt.partition(b"\r\n\r\n")
+                # Bytes past the terminator are body/stream bytes;
+                # frames inside the head were already removed.
+                rest = extra_txt + buf
                 break
-            d = self.sock.recv(4096)
-            if not d:
-                return "", {}, ""
-            buf += d
-        # A desynced stream (a body the framing missed, a torn prior
-        # read) leaves non-status bytes at the front; resync onto the
-        # next real status line instead of misreading a header as one.
-        if not buf.startswith(b"RTSP/1.0 "):
-            import sys as _sys
-            print("rtsplib: desync before %s response, head=%r" % (method, buf[:120]),
-                  file=_sys.stderr, flush=True)
-            prev_to = self.sock.gettimeout()
-            self.sock.settimeout(3.0)
-            try:
-                for _ in range(32):
-                    m = buf.find(b"RTSP/1.0 ")
-                    if m >= 0:
-                        buf = buf[m:]
-                        break
-                    try:
-                        d = self.sock.recv(4096)
-                    except OSError:
-                        break
-                    if not d:
-                        break
-                    buf += d
-                while buf.startswith(b"RTSP/1.0 ") and b"\r\n\r\n" not in buf:
-                    try:
-                        d = self.sock.recv(4096)
-                    except OSError:
-                        break
-                    if not d:
-                        break
-                    buf += d
-            finally:
-                self.sock.settimeout(prev_to)
-        head, rest = buf.split(b"\r\n\r\n", 1)
-        lines = head.decode(errors="replace").split("\r\n")
+        lines = head_txt.decode(errors="replace").split("\r\n")
         headers = {}
         for line in lines[1:]:
             if ":" in line:
