@@ -107,6 +107,18 @@ class RtspSession:
             if not d:
                 return "", {}, ""
             buf += d
+        # A desynced stream (a body the framing missed, a torn prior
+        # read) leaves non-status bytes at the front; resync onto the
+        # next real status line instead of misreading a header as one.
+        if not buf.startswith(b"RTSP/1.0 "):
+            m = buf.find(b"RTSP/1.0 ")
+            if m >= 0:
+                buf = buf[m:]
+                while b"\r\n\r\n" not in buf:
+                    d = self.sock.recv(4096)
+                    if not d:
+                        break
+                    buf += d
         head, rest = buf.split(b"\r\n\r\n", 1)
         lines = head.decode(errors="replace").split("\r\n")
         headers = {}

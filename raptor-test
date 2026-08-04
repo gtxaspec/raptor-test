@@ -302,7 +302,13 @@ if [ "$CLOCKSTEP" = 1 ] && [ -n "$SSH_TARGET" ]; then
             | grep -q '"clients":0'; then IDLE=yes; break; fi
         sleep 3
     done
-    if [ "$IDLE" = yes ]; then
+    # clients counts control connections; a timed-out UDP session can
+    # hold its RTCP instance (and the anchor) a little past clients:0.
+    # Sample up to three times so a lingering session gets reaped
+    # before the verdict; a genuinely stale anchor fails all three.
+    CS_TRIES=0
+    while [ "$IDLE" = yes ] && [ $CS_TRIES -lt 3 ]; do
+        CS_TRIES=$((CS_TRIES + 1))
         CS_REARM=$(python3 - "$HOST" "$PORT" "$RPATH" "${RTSP_USER:-}" "${RTSP_PASS:-}" <<'REARM_EOF'
 import sys, time
 sys.path.insert(0, "probes")
@@ -324,7 +330,12 @@ except OSError:
     pass
 REARM_EOF
 )
-    fi
+        if [ -n "$CS_REARM" ] &&
+            python3 -c "import sys; v=float('$CS_REARM'); sys.exit(0 if $STEP - 30 <= v <= $STEP + 30 else 1)"; then
+            break
+        fi
+        [ $CS_TRIES -lt 3 ] && sleep 15
+    done
     # Always put the clock back and restore ntpd, whatever happened.
     ssh -o ConnectTimeout=8 "$SSH_TARGET" "date -s \"@\$(( \$(date +%s) - $STEP ))\"" >/dev/null 2>&1
     # Restore through the init script: it knows the daemon's real
