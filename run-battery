@@ -43,8 +43,8 @@ esac
 # --backend <substr>: run only the pass(es) whose matrix label matches.
 # Everything else is recorded as skipped, so the matrix stays complete.
 ONLY_BACKEND=""
-if [ "$2" = "--backend" ] && [ -n "$3" ]; then
-    ONLY_BACKEND=$3
+if [ "${2:-}" = "--backend" ] && [ -n "${3:-}" ]; then
+    ONLY_BACKEND=${3:-}
 fi
 
 want_backend() {
