@@ -40,6 +40,9 @@ Options:
   --user <u> --pass <p>  RTSP digest credentials (enables the auth battery)
   --duration <s>       base capture duration (default 12)
   --go2rtc <apiurl>    test through a go2rtc restream (e.g. http://host:1984)
+                       "local" spawns a pinned go2rtc from tools/ for the run
+  --mediamtx <arg>     test through a mediamtx restream: "local" spawns a
+                       pinned mediamtx from tools/, or pass its API URL
   --frigate            record via a local dockerized Frigate, verify the clips
   --record-check <d>   verify the newest .mp4 in a directory (e.g. rmr output)
   --rhd <baseurl>      RHD HTTP checks: /snap, /mjpeg, /audio (https://host:8443)
@@ -120,6 +123,7 @@ while [ $# -gt 0 ]; do
     --ssh) SSH_TARGET=$2; shift 2 ;;
     --duration) DUR=$2; shift 2 ;;
     --go2rtc) GO2RTC=$2; shift 2 ;;
+    --mediamtx) MEDIAMTX=$2; shift 2 ;;
     --frigate) FRIGATE=1; shift ;;
     --record-check) RECDIR=$2; shift 2 ;;
     --gop) GOP_EXPECT=$2; shift 2 ;;
@@ -473,6 +477,9 @@ CLIENT_PIDS=""
 FRIGATE_NAME=""
 FRIGATE_DIR=""
 cleanup() {
+    for p in ${RESTREAMER_PIDS:-}; do
+        kill "$p" 2>/dev/null
+    done
     for p in $CLIENT_PIDS; do
         # Kill the wrapper AND its children (pkill -P), then the wrapper.
         pkill -9 -P "$p" 2>/dev/null
@@ -1624,6 +1631,87 @@ else
     fi
 fi
 
+# ── Local restreamers: pinned single-binary consumers spawned for
+#    this run, so the battery carries its own interop targets instead
+#    of depending on a helper host. ──
+GO2RTC_VER=1.9.14
+MEDIAMTX_VER=1.19.3
+RESTREAMER_PIDS=""
+
+ensure_tool() {
+    # ensure_tool <path> <url> — download once, keep pinned.
+    local path=$1 url=$2
+    [ -x "$path" ] && return 0
+    curl -fsSL -o "$path" "$url" && chmod +x "$path"
+}
+
+if [ "$GO2RTC" = "local" ]; then
+    G2BIN="$DIR/tools/go2rtc"
+    if ensure_tool "$G2BIN" \
+        "https://github.com/AlexxIT/go2rtc/releases/download/v$GO2RTC_VER/go2rtc_linux_amd64"; then
+        cat > "$WORK/go2rtc.yaml" <<G2EOF
+api:
+  listen: 127.0.0.1:11984
+rtsp:
+  listen: 127.0.0.1:18555
+webrtc:
+  listen: ""
+G2EOF
+        "$G2BIN" -config "$WORK/go2rtc.yaml" >"$WORK/go2rtc-daemon.log" 2>&1 &
+        RESTREAMER_PIDS="$RESTREAMER_PIDS $!"
+        G2UP=0
+        for _ in $(seq 1 15); do
+            curl -sf -m 2 "http://127.0.0.1:11984/api" >/dev/null 2>&1 && { G2UP=1; break; }
+            sleep 1
+        done
+        if [ "$G2UP" = 1 ]; then
+            GO2RTC="http://127.0.0.1:11984"
+        else
+            bad "go2rtc local spawn" "API never answered (see go2rtc-daemon.log)"
+            GO2RTC=""
+        fi
+    else
+        bad "go2rtc local spawn" "download failed (v$GO2RTC_VER)"
+        GO2RTC=""
+    fi
+fi
+
+if [ "$MEDIAMTX" = "local" ]; then
+    MTXBIN="$DIR/tools/mediamtx"
+    if [ ! -x "$MTXBIN" ]; then
+        curl -fsSL "https://github.com/bluenviron/mediamtx/releases/download/v$MEDIAMTX_VER/mediamtx_v${MEDIAMTX_VER}_linux_amd64.tar.gz" \
+            | tar xz -C "$WORK" mediamtx 2>/dev/null && mv "$WORK/mediamtx" "$MTXBIN" && chmod +x "$MTXBIN"
+    fi
+    if [ -x "$MTXBIN" ]; then
+        cat > "$WORK/mediamtx.yml" <<MTXEOF
+logLevel: info
+rtspAddress: 127.0.0.1:18556
+api: yes
+apiAddress: 127.0.0.1:19997
+rtmp: no
+hls: no
+webrtc: no
+srt: no
+MTXEOF
+        "$MTXBIN" "$WORK/mediamtx.yml" >"$WORK/mediamtx-daemon.log" 2>&1 &
+        RESTREAMER_PIDS="$RESTREAMER_PIDS $!"
+        MTXUP=0
+        for _ in $(seq 1 15); do
+            curl -sf -m 2 "http://127.0.0.1:19997/v3/paths/list" >/dev/null 2>&1 && { MTXUP=1; break; }
+            sleep 1
+        done
+        if [ "$MTXUP" = 1 ]; then
+            MEDIAMTX="http://127.0.0.1:19997"
+        else
+            bad "mediamtx local spawn" "API never answered (see mediamtx-daemon.log)"
+            MEDIAMTX=""
+        fi
+    else
+        bad "mediamtx local spawn" "download failed (v$MEDIAMTX_VER)"
+        MEDIAMTX=""
+    fi
+fi
+
 # ── 9. go2rtc restream (--go2rtc) ──
 if [ -n "$GO2RTC" ]; then
     G2NAME="raptortest$$"
@@ -1720,6 +1808,81 @@ EOF
     fi
 else
     skip "go2rtc leg (--go2rtc not given)"
+fi
+
+# ── 9b. mediamtx restream (--mediamtx) ──
+# mediamtx's gortsplib client is strict about SDP, RTP-Info and RTCP
+# correctness, so it exercises different interop surface than go2rtc.
+if [ -n "${MEDIAMTX:-}" ]; then
+    MTXNAME="raptortest$$"
+    MTXHOST=${MEDIAMTX#http://}
+    MTXHOST=${MTXHOST%%:*}
+    MTXRPORT=$(curl -s -m 6 "$MEDIAMTX/v3/config/global/get" 2>/dev/null \
+        | python3 -c "import json,sys; print(json.load(sys.stdin).get('rtspAddress',':8554').rsplit(':',1)[-1])" 2>/dev/null)
+    MTXRPORT=${MTXRPORT:-8554}
+    if curl -s -m 8 -X POST -H "Content-Type: application/json" \
+        -d "{\"source\": \"$URL\"}" \
+        "$MEDIAMTX/v3/config/paths/add/$MTXNAME" >/dev/null 2>&1; then
+        MTXREADY=""
+        for _ in $(seq 1 15); do
+            MTXREADY=$(curl -s -m 3 "$MEDIAMTX/v3/paths/get/$MTXNAME" 2>/dev/null \
+                | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if d.get('ready'):
+    print(','.join(d.get('tracks') or []))" 2>/dev/null)
+            [ -n "$MTXREADY" ] && break
+            sleep 1
+        done
+        if [ -n "$MTXREADY" ]; then
+            ok "mediamtx source connected ($MTXREADY)"
+        else
+            bad "mediamtx source connected" "path never became ready (gortsplib rejected the origin?)"
+        fi
+        MTXURL="rtsp://$MTXHOST:$MTXRPORT/$MTXNAME"
+        if timeout -k 5 $((DUR + 14)) "$FFMPEG" -nostdin -v warning -rtsp_transport tcp \
+            -i "$MTXURL" -t "$DUR" -f null - >"$WORK/mediamtx.log" 2>&1 \
+            && [ "$(grep -ciE "$ERRPAT" "$WORK/mediamtx.log")" -eq 0 ]; then
+            ok "mediamtx restream: clean media (${DUR}s)"
+        else
+            bad "mediamtx restream" "see below"
+            show_errs "$WORK/mediamtx.log"
+        fi
+        if [ -n "$CONFIG" ]; then
+            MTXSDP=$(python3 - "$MTXHOST" "$MTXRPORT" "/$MTXNAME" <<'EOF'
+import socket, sys
+host, port, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+s = socket.create_connection((host, port), timeout=5)
+s.sendall(f"DESCRIBE rtsp://{host}:{port}{path} RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n\r\n".encode())
+buf = b""
+import time
+t0 = time.time()
+while time.time() - t0 < 6 and len(buf) < 16384:
+    try:
+        d = s.recv(4096)
+    except socket.timeout:
+        break
+    if not d:
+        break
+    buf += d
+print(buf.decode(errors="replace"))
+EOF
+)
+            if echo "$MTXSDP" | grep -qi "config=$CONFIG"; then
+                ok "mediamtx passes AAC config= through verbatim"
+            else
+                bad "mediamtx AAC config= passthrough" "origin $CONFIG not found in restream SDP"
+            fi
+        fi
+        curl -s -m 8 -X POST "$MEDIAMTX/v3/config/paths/delete/$MTXNAME" >/dev/null 2>&1
+    else
+        bad "mediamtx API reachable" "$MEDIAMTX"
+    fi
+else
+    skip "mediamtx leg (--mediamtx not given)"
 fi
 
 # ── 9c. SRT: MPEG-TS over SRT (rsr) (--srt) ──

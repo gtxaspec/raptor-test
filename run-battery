@@ -323,7 +323,7 @@ battery_for_target() {
     SIGN_PASS=''
     RTSP_PORT=554; PATH0=stream0; PATH1=stream1
     R555_PORT=''; R555_PATH0=stream0; R555_PATH1=stream1
-    GO2RTC=''; FRIGATE=no; RECORD_CHECK=''; NOTES=''; GOP=''
+    GO2RTC=''; MEDIAMTX=''; FRIGATE=no; RECORD_CHECK=''; NOTES=''; GOP=''
     TLS=''; RTMP=''; WEBRTC=''
     # Daemon profiles (opt-in; empty DAEMONS_BASE = manage nothing)
     DAEMON_BIN=''; DAEMONS_BASE=''; DAEMONS_RECORD=''
@@ -352,6 +352,7 @@ battery_for_target() {
     [ -n "$SSH" ]          && common+=(--ssh "$SSH")
     [ -n "$USER" ]         && common+=(--user "$USER" --pass "$PASS")
     [ -n "$GO2RTC" ]       && common+=(--go2rtc "$GO2RTC")
+    [ -n "$MEDIAMTX" ]     && common+=(--mediamtx "$MEDIAMTX")
     [ "$FRIGATE" = yes ]   && common+=(--frigate)
     [ -n "$RECORD_CHECK" ] && common+=(--record-check "$RECORD_CHECK")
     [ -n "$GOP" ] && common+=(--gop "$GOP")
@@ -409,6 +410,7 @@ battery_for_target() {
         [ -n "$SSH" ]        && r555_args+=(--ssh "$SSH")
         [ -n "$USER" ]       && r555_args+=(--user "$USER" --pass "$PASS")
         [ -n "$GO2RTC" ]     && r555_args+=(--go2rtc "$GO2RTC")
+        [ -n "$MEDIAMTX" ]   && r555_args+=(--mediamtx "$MEDIAMTX")
         [ "$FRIGATE" = yes ] && r555_args+=(--frigate)
         BRINGUP_LABEL="rsd-555 (live555 RTSP)"
         brc=0
