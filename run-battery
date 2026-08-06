@@ -513,6 +513,12 @@ opus:16000:opus:48000"
         echo "################################################################"
         echo "# audio codecs (5-codec sweep)"
         echo "################################################################"
+        # CONF_SET edits the device config in place and persists, so a
+        # sweep that ends on its last entry leaves the camera holding
+        # it -- and every later run judges a device nobody configured
+        # that way. Restore the file afterwards, as the sr-wallclock
+        # pass does for its auth clear.
+        ssh -n -o ConnectTimeout=10 "$SSH" "cp '$CONFIG_PATH' '$CONFIG_PATH.codecs-bak'" 2>/dev/null
         local spec cid crate ecodec erate probe acodec arate
         for spec in $codec_matrix; do
             IFS=: read -r cid crate ecodec erate <<<"$spec"
@@ -536,6 +542,8 @@ opus:16000:opus:48000"
             fi
         done
         CONF_SET=$saved_conf
+        ssh -n -o ConnectTimeout=10 "$SSH" \
+            "mv '$CONFIG_PATH.codecs-bak' '$CONFIG_PATH'" 2>/dev/null || true
         printf '%s\t%s\t%d passed, %d failed, 0 skipped\n' "$name" \
             "audio codecs (5-codec sweep)" "$cpass" "$cfail" >>"$MATRIX_FILE"
         [ "$cfail" -ne 0 ] && OVERALL_FAIL=1
@@ -561,6 +569,10 @@ opus:16000:opus:48000"
         echo "################################################################"
         echo "# rc modes (encoder sweep): $rc_modes"
         echo "################################################################"
+        # Same restore contract as the codec sweep: capped_quality left
+        # behind changes the stream every later pass measures (it cost
+        # a battery's openRTSP leg two decode errors to learn that).
+        ssh -n -o ConnectTimeout=10 "$SSH" "cp '$CONFIG_PATH' '$CONFIG_PATH.rcmode-bak'" 2>/dev/null
         for mode in $rc_modes; do
             CONF_SET="$saved_conf stream0.rc_mode=$mode"
             if ! bringup "$RTSP_PORT" "${base_set[@]}" $DAEMONS_RTSP; then
@@ -586,6 +598,8 @@ opus:16000:opus:48000"
             fi
         done
         CONF_SET=$saved_conf
+        ssh -n -o ConnectTimeout=10 "$SSH" \
+            "mv '$CONFIG_PATH.rcmode-bak' '$CONFIG_PATH'" 2>/dev/null || true
         printf '%s\t%s\t%d passed, %d failed, 0 skipped\n' "$name" \
             "rc modes (encoder sweep)" "$rpass" "$rfail" >>"$MATRIX_FILE"
         [ "$rfail" -ne 0 ] && OVERALL_FAIL=1
