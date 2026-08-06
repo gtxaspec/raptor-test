@@ -279,6 +279,8 @@ bringup() {
 
 # One line of the final matrix per (target,backend): "target backend result"
 MATRIX_FILE=$(mktemp)
+WORKROOT=$(mktemp -d)
+trap 'rm -rf "$WORKROOT"' EXIT
 trap 'rm -f "$MATRIX_FILE"' EXIT
 OVERALL_FAIL=0
 
@@ -605,6 +607,103 @@ opus:16000:opus:48000"
         [ "$rfail" -ne 0 ] && OVERALL_FAIL=1
     else
         printf '%s\t%s\tn/a\n' "$name" "rc modes (encoder sweep)" >>"$MATRIX_FILE"
+    fi
+
+    # Backend 4d: recording. Continuous segments at 15s granularity:
+    # every chained rotation must open on a wall-clock boundary (the
+    # :00 the OSD shows) and every segment must decode. Ported from
+    # raptor/tests/test-rmr-record.sh, which did this on-device from
+    # the wrong repo and was orchestrated by nothing.
+    if ! want_backend "recording (segments + alignment)"; then
+        printf '%s\t%s\tskipped (--backend %s)\n' "$name" \
+            "recording (segments + alignment)" "$ONLY_BACKEND" >>"$MATRIX_FILE"
+    elif [ -n "$DAEMONS_BASE" ] && [ -n "$DAEMONS_RECORD" ] && [ -n "$SSH" ]; then
+        BRINGUP_LABEL="recording (segments + alignment)"
+        local saved_conf=$CONF_SET
+        local recpass=0 recfail=0 recdir
+        # Bench units often have no SD; NFS is a distinct filesystem so
+        # rmr's rootfs auto-create refusal does not apply.
+        if ssh -n -o ConnectTimeout=8 "$SSH" 'grep -q mmcblk /proc/mounts' 2>/dev/null; then
+            recdir=/mnt/mmcblk0p1/raptor-battery
+        else
+            recdir=/mnt/nfs/tmp/raptor-battery-rec
+            mkdir -p "$HOME/tmp/raptor-battery-rec" && chmod 1777 "$HOME/tmp/raptor-battery-rec"
+        fi
+        echo
+        echo "################################################################"
+        echo "# recording (segments + alignment) -> $recdir"
+        echo "################################################################"
+        ssh -n -o ConnectTimeout=10 "$SSH" "cp '$CONFIG_PATH' '$CONFIG_PATH.rec-bak'" 2>/dev/null
+        ssh -n -o ConnectTimeout=10 "$SSH" "rm -rf '$recdir'; mkdir -p '$recdir'" 2>/dev/null
+        CONF_SET="$saved_conf recording.enabled=true recording.mode=continuous"
+        CONF_SET="$CONF_SET recording.storage_path=$recdir recording.segment_seconds=15"
+        if bringup - "${base_set[@]}" $DAEMONS_RECORD; then
+            sleep 55
+            ssh -n -o ConnectTimeout=8 "$SSH" 'killall rmr 2>/dev/null' 2>/dev/null || true
+            sleep 2
+            local names align
+            names=$(ssh -n -o ConnectTimeout=8 "$SSH" \
+                "find '$recdir' -name '*.mp4' -type f" 2>/dev/null | xargs -rn1 basename | sort)
+            if align=$(printf '%s\n' "$names" | python3 -c "
+import sys
+names = [l.strip() for l in sys.stdin if l.strip()]
+secs = []
+for n in names:
+    try:
+        h, m, s = n[:-4].split('-')
+        secs.append((int(h) * 3600 + int(m) * 60 + int(s), n))
+    except ValueError:
+        pass
+secs.sort()
+pairs, bad = 0, []
+for (a, _), (b, nm) in zip(secs, secs[1:]):
+    if 13 <= b - a <= 17:
+        pairs += 1
+        if 1 < b % 15 < 14:
+            bad.append(nm)
+print(f'{len(secs)} segments, {pairs} chained rotations, misaligned: {bad}')
+sys.exit(1 if bad or pairs < 2 else 0)"); then
+                echo "  PASS  chained rotations open on wall-clock boundaries ($align)"
+                recpass=$((recpass + 1))
+            elif [ "$(echo "$names" | wc -w)" -le 1 ]; then
+                # One segment in the window means the interval was not
+                # applied: an rmr predating segment_seconds ignores the
+                # key and falls back to segment_minutes.
+                echo "  FAIL  segment alignment: $align -- device rmr may predate segment_seconds"
+                recfail=$((recfail + 1))
+            else
+                echo "  FAIL  segment alignment: $align"
+                recfail=$((recfail + 1))
+            fi
+            # Every segment must decode: a boundary-aligned file that
+            # is not playable is worse than a misaligned one.
+            local dec_bad=0 seg
+            for seg in $names; do
+                ssh -n -o ConnectTimeout=8 "$SSH" "cat '$recdir/$seg'" 2>/dev/null \
+                    > "$WORKROOT/seg.mp4" || continue
+                "$DIR/tools/ffprobe" -v error -show_entries stream=codec_name \
+                    -of csv=p=0 "$WORKROOT/seg.mp4" >/dev/null 2>&1 || dec_bad=$((dec_bad + 1))
+            done
+            if [ "$dec_bad" -eq 0 ]; then
+                echo "  PASS  every segment decodes ($(echo "$names" | wc -w) files)"
+                recpass=$((recpass + 1))
+            else
+                echo "  FAIL  segment decode: $dec_bad unreadable"
+                recfail=$((recfail + 1))
+            fi
+            ssh -n -o ConnectTimeout=8 "$SSH" "rm -rf '$recdir'" 2>/dev/null || true
+        else
+            echo "  FAIL  recording bring-up"
+            recfail=$((recfail + 1))
+        fi
+        CONF_SET=$saved_conf
+        ssh -n -o ConnectTimeout=10 "$SSH" \
+            "mv '$CONFIG_PATH.rec-bak' '$CONFIG_PATH'" 2>/dev/null || true
+        printf '%s\t%s\t%d passed, %d failed, 0 skipped\n' "$name" \
+            "recording (segments + alignment)" "$recpass" "$recfail" >>"$MATRIX_FILE"
+        [ "$recfail" -ne 0 ] && OVERALL_FAIL=1
+    else
+        printf '%s\t%s\tn/a\n' "$name" "recording (segments + alignment)" >>"$MATRIX_FILE"
     fi
 
     # Backend 5: IPv6. The lab is dual-stacked and the policy is
