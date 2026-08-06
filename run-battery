@@ -486,6 +486,113 @@ battery_for_target() {
         printf '%s\t%s\tn/a\n' "$name" "signing (SEI + signed snapshots)" >>"$MATRIX_FILE"
     fi
 
+    # Authed RTSP URL for the direct-probe passes below (raptor-test
+    # takes credentials as flags; ffprobe wants them in the URL).
+    local auth_main="rtsp://$HOST:$RTSP_PORT/$PATH0"
+    [ -n "$USER" ] && auth_main="rtsp://$USER:$PASS@$HOST:$RTSP_PORT/$PATH0"
+
+    # Backend 4b: audio codec matrix. Every other pass runs whichever
+    # codec the device ships with, so the other four encoders are only
+    # ever exercised by whoever remembers to reconfigure a camera by
+    # hand. Ported from raptor/tests/stream-health.sh, which swept them
+    # on-device but was orchestrated by nothing.
+    if ! want_backend "audio codecs (5-codec sweep)"; then
+        printf '%s\t%s\tskipped (--backend %s)\n' "$name" \
+            "audio codecs (5-codec sweep)" "$ONLY_BACKEND" >>"$MATRIX_FILE"
+    elif [ -n "$DAEMONS_BASE" ] && [ -n "$SSH" ]; then
+        BRINGUP_LABEL="audio codecs (5-codec sweep)"
+        local saved_conf=$CONF_SET
+        local cpass=0 cfail=0
+        # codec:rate:expected_ffprobe_codec:expected_ffprobe_rate
+        local codec_matrix="pcmu:8000:pcm_mulaw:8000
+pcma:8000:pcm_alaw:8000
+l16:16000:pcm_s16be:16000
+aac:16000:aac:16000
+opus:16000:opus:48000"
+        echo
+        echo "################################################################"
+        echo "# audio codecs (5-codec sweep)"
+        echo "################################################################"
+        local spec cid crate ecodec erate probe acodec arate
+        for spec in $codec_matrix; do
+            IFS=: read -r cid crate ecodec erate <<<"$spec"
+            CONF_SET="$saved_conf audio.codec=$cid audio.sample_rate=$crate"
+            if ! bringup "$RTSP_PORT" "${base_set[@]}" $DAEMONS_RTSP; then
+                echo "  FAIL  $cid: bring-up"
+                cfail=$((cfail + 1))
+                continue
+            fi
+            probe=$(timeout -k 5 25 "$DIR/tools/ffprobe" -v error -rtsp_transport tcp \
+                -select_streams a -show_entries stream=codec_name,sample_rate \
+                -of csv=p=0 "$auth_main" 2>/dev/null | head -1)
+            acodec=${probe%%,*}
+            arate=${probe##*,}
+            if [ "$acodec" = "$ecodec" ] && [ "$arate" = "$erate" ]; then
+                echo "  PASS  $cid: decodes as $acodec @ ${arate}Hz"
+                cpass=$((cpass + 1))
+            else
+                echo "  FAIL  $cid: got '${probe:-nothing}', expected $ecodec,$erate"
+                cfail=$((cfail + 1))
+            fi
+        done
+        CONF_SET=$saved_conf
+        printf '%s\t%s\t%d passed, %d failed, 0 skipped\n' "$name" \
+            "audio codecs (5-codec sweep)" "$cpass" "$cfail" >>"$MATRIX_FILE"
+        [ "$cfail" -ne 0 ] && OVERALL_FAIL=1
+    else
+        printf '%s\t%s\tn/a\n' "$name" "audio codecs (5-codec sweep)" >>"$MATRIX_FILE"
+    fi
+
+    # Backend 4c: encoder RC modes. Which modes exist is a platform
+    # capability, so the list comes from the encoder itself rather than
+    # a hardcoded table. Ported from raptor/tests/device-test.sh.
+    if ! want_backend "rc modes (encoder sweep)"; then
+        printf '%s\t%s\tskipped (--backend %s)\n' "$name" \
+            "rc modes (encoder sweep)" "$ONLY_BACKEND" >>"$MATRIX_FILE"
+    elif [ -n "$DAEMONS_BASE" ] && [ -n "$SSH" ]; then
+        BRINGUP_LABEL="rc modes (encoder sweep)"
+        local saved_conf=$CONF_SET
+        local rpass=0 rfail=0 caps rc_modes mode readback
+        caps=$(ssh -n -o ConnectTimeout=8 "$SSH" "timeout 4 raptorctl rvd get-enc-caps" 2>/dev/null)
+        rc_modes="cbr vbr fixqp"
+        echo "$caps" | grep -q '"capped_rc":true' && rc_modes="$rc_modes capped_vbr capped_quality"
+        echo "$caps" | grep -q '"smart_rc":true' && rc_modes="$rc_modes smart"
+        echo
+        echo "################################################################"
+        echo "# rc modes (encoder sweep): $rc_modes"
+        echo "################################################################"
+        for mode in $rc_modes; do
+            CONF_SET="$saved_conf stream0.rc_mode=$mode"
+            if ! bringup "$RTSP_PORT" "${base_set[@]}" $DAEMONS_RTSP; then
+                echo "  FAIL  $mode: bring-up"
+                rfail=$((rfail + 1))
+                continue
+            fi
+            readback=$(ssh -n -o ConnectTimeout=8 "$SSH" \
+                "timeout 4 raptorctl rvd get-rc-mode 0" 2>/dev/null |
+                grep -o '"rc_mode":"[a-z_]*"' | cut -d'"' -f4)
+            probe=$(timeout -k 5 25 "$DIR/tools/ffprobe" -v error -rtsp_transport tcp \
+                -select_streams v -show_entries stream=codec_name -of csv=p=0 \
+                "$auth_main" 2>/dev/null | head -1)
+            if [ "$readback" = "$mode" ] && [ -n "$probe" ]; then
+                echo "  PASS  $mode: readback matches and encoder streams ($probe)"
+                rpass=$((rpass + 1))
+            elif [ -n "$readback" ] && [ "$readback" != "$mode" ]; then
+                echo "  FAIL  $mode: readback says '$readback' -- SDK rejected or fell back"
+                rfail=$((rfail + 1))
+            else
+                echo "  FAIL  $mode: stream='${probe:-nothing}' readback='${readback:-none}'"
+                rfail=$((rfail + 1))
+            fi
+        done
+        CONF_SET=$saved_conf
+        printf '%s\t%s\t%d passed, %d failed, 0 skipped\n' "$name" \
+            "rc modes (encoder sweep)" "$rpass" "$rfail" >>"$MATRIX_FILE"
+        [ "$rfail" -ne 0 ] && OVERALL_FAIL=1
+    else
+        printf '%s\t%s\tn/a\n' "$name" "rc modes (encoder sweep)" >>"$MATRIX_FILE"
+    fi
+
     # Backend 5: IPv6. The lab is dual-stacked and the policy is
     # v6-first, so the core suite must also pass against an IPv6
     # literal, not just the v4 address every other pass dials. Same
