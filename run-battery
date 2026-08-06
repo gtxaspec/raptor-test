@@ -441,6 +441,10 @@ battery_for_target() {
         local -a h265_args=(--core)
         [ -n "$SSH" ]  && h265_args+=(--ssh "$SSH")
         [ -n "$USER" ] && h265_args+=(--user "$USER" --pass "$PASS")
+        # Restream interop for HEVC: strict consumers (gortsplib) are
+        # exactly where sprop/marker/AU bugs surface.
+        [ -n "$GO2RTC" ]   && h265_args+=(--go2rtc "$GO2RTC")
+        [ -n "$MEDIAMTX" ] && h265_args+=(--mediamtx "$MEDIAMTX")
         BRINGUP_LABEL="h265 (sub stream)"
         local saved_conf=$CONF_SET
         CONF_SET="$CONF_SET stream1.codec=h265"
