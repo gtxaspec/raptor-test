@@ -382,6 +382,10 @@ battery_for_target() {
     # inside this pass, and every later pass brings its daemons up
     # from scratch anyway. They need ssh to reach the device.
     [ -n "$SSH" ]  && rsd_args+=(--clock-step --producer-restart)
+    # Malformed-input robustness against the real device parser. The
+    # flag existed and the battery never passed it, so every run has
+    # been reporting a clean matrix with the fuzzer sitting out.
+    rsd_args+=(--fuzz)
     [ -n "$TLS" ]  && rsd_args+=(--tls "$TLS")
     [ -n "$RTMP" ] && rsd_args+=(--rtmp "$RTMP")
     [ -n "$WEBRTC" ] && rsd_args+=(--webrtc "$WEBRTC")
