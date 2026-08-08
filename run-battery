@@ -25,6 +25,12 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 TDIR="$DIR/targets"
 SUITE="$DIR/raptor-test"
 
+# Extra raptor-test flags appended to every pass, from the environment
+# or a target conf (conf wins for its target). The knob exists for
+# runs that need longer sample windows, e.g.:
+#   SUITE_EXTRA="--dur 60 --srt-secs 60 --drift-secs 60" ./run-battery t31-z55
+SUITE_EXTRA_ENV=${SUITE_EXTRA:-}
+
 usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 list_targets() {
@@ -292,10 +298,11 @@ run_suite() {
     echo
     echo "################################################################"
     echo "# $label"
-    echo "#   $url ${*}"
+    echo "#   $url ${*} ${SUITE_EXTRA:-}"
     echo "################################################################"
     local out
-    out=$("$SUITE" "$url" "$@" 2>&1)
+    # shellcheck disable=SC2086  # SUITE_EXTRA is a flag list, split intended
+    out=$("$SUITE" "$url" "$@" ${SUITE_EXTRA:-} 2>&1)
     echo "$out"
     local res
     res=$(echo "$out" | grep -oE '[0-9]+ passed, [0-9]+ failed, [0-9]+ skipped' | tail -1)
@@ -332,6 +339,7 @@ battery_for_target() {
     DAEMONS_RTSP='rsd'; DAEMONS_R555='rsd-555'; DAEMONS_SRT='rsr'
     DAEMONS_RHD='rhd'; DAEMONS_WEBRTC='rwd'; DAEMONS_RTMP='rsp'
     DAEMONS_UVC='rwc'; RAM_MB=''; CONFIG_PATH=/etc/raptor.conf; CONF_SET=''
+    SUITE_EXTRA=$SUITE_EXTRA_ENV
     # A syntax error (e.g. unquoted parens in NOTES) makes bash abort
     # sourcing mid-file, silently dropping every field after the bad
     # line. That must be a hard error, never a partial run.
