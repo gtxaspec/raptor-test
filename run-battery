@@ -763,20 +763,105 @@ sys.exit(1 if bad or pairs < 2 else 0)"); then
             echo "# sr-wallclock (rlatency)"
             echo "#   rtsp://$HOST:$RTSP_PORT/$PATH0 -n 200"
             echo "################################################################"
-            local rlat_out p50 verdict
+            # The SR anchor maps stream time to the DEVICE's wall clock;
+            # rlatency compares against THIS host's clock, so the raw p50
+            # includes however far the camera's ntpd sits from the host
+            # (tens of ms between polls is routine for busybox ntpd, and
+            # it reads as a rock-steady bias -- a bench cam has swung
+            # 400ms across a day). Measure the offset by streaming the
+            # device's seconds and host-timestamping the tick boundaries,
+            # once BEFORE and once AFTER the rlatency run: the mean
+            # cancels linear drift across the leg, and a disagreement
+            # beyond 50ms means ntpd stepped mid-leg, which no single
+            # correction can repair -- that run is n/a, not a verdict.
+            # The one-way ssh pipe delay (a few ms on the bench LAN) is
+            # common to both samples; the 25ms bound absorbs it.
+            # Clock reads must not fork: date-per-tick on a loaded
+            # single-core camera puts fork latency (tens of ms)
+            # between the tick and the line, and the device reads
+            # tens of ms less ahead than it is. awk reads systime()
+            # in-process and only forks for the sleep afterwards; the
+            # host timestamps arrivals in-process the same way.
+            # First-seen tick detection overshoots the true boundary by
+            # a uniform 0..sampling-period, so the mean is late by half
+            # a period -- estimate the period from the arrival stream
+            # and add it back, or the device reads ~period/2 less ahead
+            # than it is (25ms of phantom bias at the observed rates).
+            measure_clock_offset_ms() {
+                ssh -o ConnectTimeout=8 "$SSH" \
+                    'busybox awk "BEGIN { for (i = 0; i < 120; i++) { print systime(); fflush(); system(\"usleep 25000\") } }"' 2>/dev/null |
+                    python3 -c '
+import sys, time
+samples = []
+for line in sys.stdin:
+    h = time.time()
+    try:
+        samples.append((int(line), h))
+    except ValueError:
+        continue
+deltas = sorted(b[1] - a[1] for a, b in zip(samples, samples[1:]))
+period = deltas[len(deltas) // 2] if deltas else 0
+first = {}
+for d, h in samples:
+    first.setdefault(d, h)
+ds = sorted(first)[1:]  # first second is joined mid-tick, discard
+offs = [-(first[d] - d) * 1000 for d in ds]
+if offs:
+    print(f"{sum(offs) / len(offs) + period * 1000 / 2:.1f}")
+' 2>/dev/null
+            }
+            local rlat_out p50 verdict offset_ms off_before off_after stepped
+            off_before=$(measure_clock_offset_ms)
             rlat_out=$(timeout 60 "$rlat" "rtsp://$HOST:$RTSP_PORT/$PATH0" -n 200 -q 2>&1)
             echo "$rlat_out" | tail -9
             p50=$(echo "$rlat_out" | sed -n 's/.*P50: *\(-*[0-9.]*\) ms.*/\1/p')
+            off_after=$(measure_clock_offset_ms)
+            offset_ms=""
+            stepped=""
+            if [ -n "$off_before" ] && [ -n "$off_after" ]; then
+                if awk -v a="$off_before" -v b="$off_after" \
+                    'BEGIN { d = a - b; if (d < 0) d = -d; exit !(d > 50) }'; then
+                    stepped="clock stepped during leg (${off_before}ms -> ${off_after}ms)"
+                else
+                    offset_ms=$(awk -v a="$off_before" -v b="$off_after" \
+                        'BEGIN { printf "%.1f", (a + b) / 2 }')
+                fi
+            else
+                offset_ms=${off_before:-$off_after}
+            fi
             if [ -z "$p50" ]; then
                 verdict="FAIL (no samples: $(echo "$rlat_out" | tail -1))"
                 OVERALL_FAIL=1
+            elif [ -n "$stepped" ]; then
+                verdict="n/a ($stepped)"
+            elif [ -n "$offset_ms" ]; then
+                echo "  device clock offset vs host: ${offset_ms}ms (positive = device ahead," \
+                    "mean of ${off_before}/${off_after})"
+                # Corrected p50 = SR anchor error + true pipeline
+                # latency. Latency is always positive (tens of ms for
+                # capture->encode->wire), so give it headroom on the
+                # positive side; meaningfully negative is physically
+                # impossible and means the anchor itself is off.
+                verdict=$(awk -v p="$p50" -v o="$offset_ms" 'BEGIN {
+                    c = p + o
+                    a = c < 0 ? -c : c
+                    if (a > 1000)
+                        printf "n/a (host-camera clocks unsynced: corrected %.1fms)", c
+                    else if (c > -25 && c <= 75)
+                        printf "PASS (raw p50=%sms, clock offset %sms, corrected %.1fms)", p, o, c
+                    else
+                        printf "FAIL (SR anchor off: corrected %.1fms, raw %sms, offset %sms)", c, p, o
+                }')
+                case "$verdict" in FAIL*) OVERALL_FAIL=1 ;; esac
             else
+                # Offset unmeasurable (no usleep on target, ssh hiccup):
+                # fall back to the raw bound and say so.
                 verdict=$(awk -v p="$p50" 'BEGIN {
                     a = p < 0 ? -p : p
-                    if (a <= 25) print "PASS (p50=" p "ms)"
+                    if (a <= 25) print "PASS (p50=" p "ms, offset unmeasured)"
                     else if (a > 1000)
                         print "n/a (host-camera clocks unsynced: p50=" p "ms)"
-                    else print "FAIL (SR anchor off by " p "ms)"
+                    else print "FAIL (SR anchor off by " p "ms, offset unmeasured)"
                 }')
                 case "$verdict" in FAIL*) OVERALL_FAIL=1 ;; esac
             fi
