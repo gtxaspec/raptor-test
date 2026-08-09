@@ -4,6 +4,28 @@ One file per lab device, sourced by `run-battery`. Each defines where
 the device is and which backends/legs it exposes, so the **same full
 battery** runs on every target — nothing is chosen ad-hoc at run time.
 
+**No on-device config is ever read or edited.** Every bring-up pushes
+the repo's stock template (`STOCK_CONF`, default
+`../raptor/config/raptor.conf`) to `/tmp` on the device, applies the
+pass's section enables and `CONF_SET` entries to a fresh copy, and
+launches the daemons with `-c /tmp/raptor-test.conf`. The baseline
+therefore always matches the code under test — a device's own config
+may predate it — and a battery's config inputs are exactly two
+reviewable things: the template in the repo and the manifest. A
+target states every deviation from stock in `CONF_SET` (fleet shape
+like `ring.refmode`, credentials for the auth legs). Nothing on the
+device can skew a run, nothing a run does persists, and there is no
+backup/restore step to forget. On-device testing outside the battery
+should follow the same rule.
+
+**The baseline enables every feature the suite can exercise** —
+backchannel, MJPEG-over-RTSP, and so on — regardless of what any
+distribution ships enabled. The battery tests what the code supports,
+not what a product turns on; a feature off in `CONF_SET` is a leg
+that silently stops running. The only structured exception is the
+signing pass: SEI and snapshot signing change what every decoder leg
+receives, so they live in their own pass instead of the baseline.
+
 Copy `_template.conf` to `<name>.conf` and fill it in. Site confs
 (`targets/*.conf`) are deliberately untracked -- they hold your lab's
 IPs and layout and never belong in the repo; only the template is.
