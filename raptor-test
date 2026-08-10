@@ -1660,6 +1660,86 @@ else
     skip "mpv (not installed)"
 fi
 
+# ── 8d. Join contract: first video frame is a keyframe, pts chain sane ──
+# The server must hold new clients until a keyframe (rsd c7c0770):
+# orphan pre-IDR P-frames are concealed by live decoders but recorders
+# (Frigate, ffmpeg -c copy) write them into files that decode with
+# missing refs. Flip side: libav gives the first completed packet of an
+# RTSP session no pts (observed against compy-rsd, rsd-555 and live555
+# alike), so with a keyframe-first server that one N/A lands on the
+# IDR and mpv prints a one-time "No video PTS!" on join. That line is
+# expected start noise, not a failure; what must hold is exactly one
+# leading N/A and a monotone pts chain after it.
+if [ "$AUDIO_ONLY" = 1 ]; then
+    skip "join contract (audio-only source)"
+else
+    "$FFPROBE" -v error -rtsp_transport tcp -select_streams v \
+        -show_packets -show_data -read_intervals %+1 "$URL" \
+        >"$WORK/join_pkts.txt" 2>/dev/null
+    JOIN_VERDICT=$(python3 - "${VCODEC:-h264}" <"$WORK/join_pkts.txt" <<'PYEOF'
+import sys
+
+codec = sys.argv[1]
+pkts, cur = [], None
+for line in sys.stdin:
+    line = line.strip()
+    if line == "[PACKET]":
+        cur = {"pts": None, "hex": []}
+    elif line == "[/PACKET]":
+        if cur is not None:
+            pkts.append(cur)
+            cur = None
+    elif cur is not None:
+        if line.startswith("pts_time="):
+            v = line.split("=", 1)[1]
+            cur["pts"] = None if v == "N/A" else float(v)
+        elif ": " in line:
+            off, _, rest = line.partition(": ")
+            if off.replace(" ", "").isalnum():
+                cur["hex"].append(rest[:40].replace(" ", ""))
+
+if len(pkts) < 5:
+    print(f"FAIL only {len(pkts)} video packets in 1s probe")
+    sys.exit(0)
+
+head = "".join(pkts[0]["hex"])[:24]
+try:
+    b = bytes.fromhex(head[: len(head) // 2 * 2])
+except ValueError:
+    b = b""
+nal = -1
+for j in range(len(b) - 4):
+    if b[j:j + 3] == b"\x00\x00\x01":
+        nal = b[j + 3]
+        break
+if codec == "hevc":
+    ntype = (nal >> 1) & 0x3F
+    keyish = ntype in (32, 33, 34, 19, 20, 21)
+else:
+    ntype = nal & 0x1F
+    keyish = ntype in (5, 7, 8)
+if nal < 0:
+    print(f"FAIL no NAL start code in first packet (head {head})")
+elif not keyish:
+    print(f"FAIL join sent non-key frame first ({codec} nal type {ntype})")
+else:
+    na_late = [i for i, p in enumerate(pkts) if p["pts"] is None and i > 0]
+    seq = [p["pts"] for p in pkts if p["pts"] is not None]
+    if na_late:
+        print(f"FAIL pts N/A beyond first packet (indexes {na_late[:4]})")
+    elif any(b <= a for a, b in zip(seq, seq[1:])):
+        print("FAIL pts chain not monotone")
+    else:
+        na0 = "one leading N/A (libav quirk)" if pkts[0]["pts"] is None else "pts from pkt0"
+        print(f"OK keyframe-first ({codec} nal {ntype}), {na0}, {len(seq)} pts monotone")
+PYEOF
+)
+    case "$JOIN_VERDICT" in
+    OK*) ok "join contract: ${JOIN_VERDICT#OK }" ;;
+    *) bad "join contract" "${JOIN_VERDICT#FAIL }" ;;
+    esac
+fi
+
 # ── 8c. openRTSP: the live555 client stack (VLC's RTSP lineage) ──
 # ffmpeg and mpv share libav's RTSP; live555 negotiates and consumes
 # sessions differently, so it exercises server paths they cannot.
