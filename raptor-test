@@ -311,7 +311,7 @@ secs=$1; shift
 t0=$(date +%s); flaps=0; ledoff=0; n=0
 while [ $(( $(date +%s)-t0 )) -lt "$secs" ]; do
     s=$(raptorctl ric status 2>/dev/null); n=$((n+1))
-    case "$s" in *"\"state\":\"night\""*) ;; *) flaps=$((flaps+1));; esac
+    case "$s" in *"\"state\":\"night\""*) ;; "") ;; *) flaps=$((flaps+1));; esac
     for p in "$@"; do
         v=$(cat /sys/class/gpio/gpio"$p"/value 2>/dev/null)
         [ "$v" = "0" ] && ledoff=$((ledoff+1))
@@ -423,18 +423,20 @@ echo "$n $flaps $ledoff"'
                 DUSK_T=$(echo "$R" | cut -d' ' -f2)
                 DARK_CEIL=$(echo "$R" | cut -d' ' -f3)
                 ok "daynight: dusk reaches night (${DUSK_T}s)"
-                sleep 4
-                NG=$(DN_SSH "raptorctl ric status" </dev/null |
-                    sed -n 's/.*"total_gain":\([0-9]*\).*/\1/p')
-                # Photon check: IR light on a close scene must pull AE well
-                # under the dark no-IR ceiling seen seconds earlier.
-                if [ -n "$NIGHT_SET" ] && [ -n "$NG" ] && [ -n "$DARK_CEIL" ] &&
-                    [ "$DARK_CEIL" -gt 0 ]; then
-                    if [ "$NG" -lt $((DARK_CEIL * 80 / 100)) ]; then
-                        ok "daynight: IR emitters light the scene (gain $DARK_CEIL -> $NG)"
+                sleep 6
+                NL=$(DN_SSH "raptorctl ric status" </dev/null |
+                    sed -n 's/.*"ae_luma":\([0-9]*\).*/\1/p')
+                # Photon check: luma is AE-normalized, so with the LEDs
+                # actually emitting, the IR-lit scene reads near the AE
+                # target (~70 on both benches) within seconds; a dead
+                # emitter leaves the dark-scene luma (<10). Gain cannot
+                # carry this check: fast triggers sample it mid-walk.
+                if [ -n "$NIGHT_SET" ] && [ -n "$NL" ]; then
+                    if [ "$NL" -ge 30 ]; then
+                        ok "daynight: IR emitters light the scene (night luma $NL)"
                     else
                         bad "daynight: IR emitters light the scene" \
-                            "gain $NG vs dark ceiling $DARK_CEIL: LEDs driven but dark?"
+                            "night luma $NL with LEDs driven: dark scene, dead emitter?"
                     fi
                 fi
                 ;;
@@ -452,6 +454,11 @@ echo "$n $flaps $ledoff"'
                     "samples=$HN flaps=$HF led-off-samples=$HL"
             fi
 
+            # Wash-dominated benches (IR a hand-span from the wall) can hide
+            # the room lights from every AE metric; a short recheck interval
+            # bounds the dawn legs. Set only AFTER the dark hold, which must
+            # run at the default cadence to stay a pure false-blink detector.
+            DN_SSH "raptorctl ric set-threshold probe_recheck_sec 20" </dev/null > /dev/null 2>&1
             PROBE_BEFORE=$(DN_SSH "logread 2>/dev/null | grep -c 'ambient probe'" </dev/null)
             eval "$LIGHTS_ON_CMD" > /dev/null 2>&1
             R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- day 90)
@@ -500,19 +507,11 @@ echo "$n $flaps $ledoff"'
             OK*) ok "daynight: lights restored, day again ($(echo "$R" | cut -d' ' -f2)s)" ;;
             *) bad "daynight: lights restored, day again" "$R" ;;
             esac
+            DN_SSH "raptorctl ric set-threshold probe_recheck_sec 600" </dev/null > /dev/null 2>&1
         fi
     fi
 }
 
-# Solo mode: just the day/night hardware cycle, no stream battery.
-# For quick IR/ircut iteration on the bench:
-#   raptor-test --daynight-only --ssh root@cam \
-#       --lights-on '<cmd>' --lights-off '<cmd>'
-if [ "${DAYNIGHT_ONLY:-0}" = 1 ]; then
-    echo "=== Day/night hardware cycle (solo) ==="
-    daynight_cycle
-    print_result
-fi
 
 
 # Legs that deliberately disturb the stream everything else
@@ -718,6 +717,16 @@ bad() {
     FAILED_NAMES+=("$1")
     json_emit fail "$1" "${2:-}"
 }
+
+# Solo mode: just the day/night hardware cycle, no stream battery.
+# For quick IR/ircut iteration on the bench:
+#   raptor-test --daynight-only --ssh root@cam \
+#       --lights-on '<cmd>' --lights-off '<cmd>'
+if [ "${DAYNIGHT_ONLY:-0}" = 1 ]; then
+    echo "=== Day/night hardware cycle (solo) ==="
+    daynight_cycle
+    print_result
+fi
 
 CLIENT_PIDS=""
 FRIGATE_NAME=""
