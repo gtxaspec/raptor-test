@@ -61,6 +61,8 @@ Options:
                        real light transitions (needs --ssh and both
                        --lights-on/--lights-off; bench with controllable
                        room lighting only)
+  --daynight-only      run ONLY the day/night cycle and exit; no rtsp
+                       URL needed (daemons must already be running)
   --lights-on <cmd>    shell command that turns the room lights on
   --lights-off <cmd>   shell command that turns the room lights off
   --json <file>        also write one JSON record per check (JSONL)
@@ -89,11 +91,12 @@ case "${1:-}" in
 -h|--help) usage; exit 0 ;;
 esac
 [ $# -ge 1 ] || { echo "usage: raptor-test <rtsp-url> [options]   (--help for the full list)" >&2; exit 2; }
-URL=$1
-shift
-case "$URL" in
-rtsp://*) ;;
-*) echo "error: first argument must be an rtsp:// URL (got: $URL)" >&2; exit 2 ;;
+# --daynight-only needs no stream: allow invocation without a URL.
+URL=""
+case "$1" in
+rtsp://*) URL=$1; shift ;;
+--daynight-only) ;;
+*) echo "error: first argument must be an rtsp:// URL (got: $1)" >&2; exit 2 ;;
 esac
 SUB_URL=""
 SSH_TARGET=""
@@ -124,6 +127,7 @@ SRT_SECS=30
 SRT_PASSPHRASE=""
 DRIFT_SECS=30
 DAYNIGHT=0
+DAYNIGHT_ONLY=0
 LIGHTS_ON_CMD=""
 LIGHTS_OFF_CMD=""
 while [ $# -gt 0 ]; do
@@ -131,6 +135,7 @@ while [ $# -gt 0 ]; do
     --sub) SUB_URL=$2; shift 2 ;;
     --ssh) SSH_TARGET=$2; shift 2 ;;
     --daynight) DAYNIGHT=1; shift ;;
+    --daynight-only) DAYNIGHT=1; DAYNIGHT_ONLY=1; shift ;;
     --lights-on) LIGHTS_ON_CMD=$2; shift 2 ;;
     --lights-off) LIGHTS_OFF_CMD=$2; shift 2 ;;
     --duration) DUR=$2; shift 2 ;;
@@ -280,6 +285,235 @@ print_result() {
     [ "$KEEP" = 1 ] && echo "  logs kept in: $WORK"
     exit 0
 }
+
+daynight_cycle() {
+    if [ -z "$SSH_TARGET" ] || [ -z "$LIGHTS_ON_CMD" ] || [ -z "$LIGHTS_OFF_CMD" ]; then
+        skip "daynight cycle (needs --ssh, --lights-on and --lights-off)"
+    else
+        DN_SSH() { ssh -o ConnectTimeout=8 "$SSH_TARGET" "$@"; }
+        # Remote: wait for a state, tracking the max gain seen on the way
+        # (the pre-night dark ceiling feeds the photon check). One ssh per
+        # leg, not one per poll.
+        DN_WAIT='
+state=$1; budget=$2
+t0=$(date +%s); maxgain=0
+while :; do
+    s=$(raptorctl ric status 2>/dev/null)
+    g=$(printf %s "$s" | sed -n "s/.*\"total_gain\":\([0-9]*\).*/\1/p")
+    [ -n "$g" ] && [ "$g" -gt "$maxgain" ] && maxgain=$g
+    case "$s" in *"\"state\":\"$state\""*)
+        echo "OK $(( $(date +%s)-t0 )) $maxgain"; exit 0;; esac
+    [ $(( $(date +%s)-t0 )) -ge "$budget" ] && { echo "TIMEOUT $budget $maxgain"; exit 1; }
+    sleep 2
+done'
+        DN_HOLD='
+secs=$1; shift
+t0=$(date +%s); flaps=0; ledoff=0; n=0
+while [ $(( $(date +%s)-t0 )) -lt "$secs" ]; do
+    s=$(raptorctl ric status 2>/dev/null); n=$((n+1))
+    case "$s" in *"\"state\":\"night\""*) ;; *) flaps=$((flaps+1));; esac
+    for p in "$@"; do
+        v=$(cat /sys/class/gpio/gpio"$p"/value 2>/dev/null)
+        [ "$v" = "0" ] && ledoff=$((ledoff+1))
+    done
+    sleep 3
+done
+echo "$n $flaps $ledoff"'
+        DN_LEDVALS='for p in "$@"; do cat /sys/class/gpio/gpio"$p"/value 2>/dev/null || echo "?"; done'
+
+        DN_STATUS=$(DN_SSH "raptorctl ric status" 2>/dev/null)
+        if ! echo "$DN_STATUS" | grep -q '"state"'; then
+            bad "daynight: ric status" "no parsable status: ${DN_STATUS:-empty}"
+        elif ! echo "$DN_STATUS" | grep -q '"mode":[[:space:]]*"auto"'; then
+            bad "daynight: ric in auto mode" "$DN_STATUS"
+        else
+            ok "daynight: ric answering in auto mode"
+            # IR LED pins from the board's hardware map (not raptor config)
+            IR_PINS=$(DN_SSH 'jct /etc/thingino.json get gpio.ir850 2>/dev/null; jct /etc/thingino.json get gpio.ir940 2>/dev/null' </dev/null | grep -E '^[0-9]+$' | tr '\n' ' ')
+            # ── manual verbs ──
+            MV=$(DN_SSH "raptorctl ric mode night" </dev/null)
+            sleep 2
+            NIGHT_SET=""
+            if [ -n "$IR_PINS" ]; then
+                i=0
+                for v in $(printf '%s\n' "$DN_LEDVALS" | DN_SSH sh -s -- $IR_PINS); do
+                    i=$((i + 1))
+                    pin=$(echo "$IR_PINS" | cut -d' ' -f$i)
+                    [ "$v" = "1" ] && NIGHT_SET="$NIGHT_SET $pin"
+                done
+                NIGHT_SET=${NIGHT_SET# }
+                if [ -n "$NIGHT_SET" ]; then
+                    ok "daynight: forced night lights an IR bank (gpio $NIGHT_SET)"
+                else
+                    bad "daynight: forced night lights an IR bank" \
+                        "pins $IR_PINS all low after mode night"
+                fi
+            else
+                skip "daynight: IR LED rail checks (no IR pins in thingino.json)"
+            fi
+            echo "$MV" | grep -q '"state":[[:space:]]*"night"' &&
+                ok "daynight: mode night forces night" ||
+                bad "daynight: mode night forces night" "$MV"
+            MV=$(DN_SSH "raptorctl ric mode day" </dev/null)
+            sleep 2
+            echo "$MV" | grep -q '"state":[[:space:]]*"day"' &&
+                ok "daynight: mode day forces day" ||
+                bad "daynight: mode day forces day" "$MV"
+            if [ -n "$NIGHT_SET" ]; then
+                LOW=1
+                for v in $(printf '%s\n' "$DN_LEDVALS" | DN_SSH sh -s -- $NIGHT_SET); do
+                    [ "$v" = "0" ] || LOW=0
+                done
+                [ "$LOW" = 1 ] &&
+                    ok "daynight: forced day cuts the IR bank" ||
+                    bad "daynight: forced day cuts the IR bank" "gpio $NIGHT_SET not all low"
+            fi
+            for bank in ir850 ir940; do
+                RC=$(DN_SSH "raptorctl ric $bank on" </dev/null)
+                case "$RC" in
+                *'"status":"ok"'*)
+                    DN_SSH "raptorctl ric $bank off" </dev/null > /dev/null 2>&1
+                    ok "daynight: manual $bank on/off" ;;
+                *"no $bank pin"*)
+                    skip "daynight: manual $bank (no pin on this board)" ;;
+                *)
+                    bad "daynight: manual $bank" "$RC" ;;
+                esac
+            done
+            DN_SSH "raptorctl ric ircut night" </dev/null | grep -q '"status":"ok"' &&
+                DN_SSH "raptorctl ric ircut day" </dev/null | grep -q '"status":"ok"' &&
+                ok "daynight: manual ircut night/day" ||
+                bad "daynight: manual ircut night/day" "drive rejected"
+            # Perturbed rails must yield to a forced mode: bench verbs move
+            # hardware without touching the daemon's bookkeeping, and a
+            # force that matches the bookkept state must still drive (the
+            # Wyze V3 silent-no-op bug). Only the auto-managed bank is
+            # asserted low: a manually lit disabled bank staying lit is
+            # documented manual-beats-automatic behavior.
+            if [ -n "$NIGHT_SET" ]; then
+                DN_SSH "raptorctl ric ir850 on 2>/dev/null; raptorctl ric ir940 on 2>/dev/null; raptorctl ric ircut night" </dev/null > /dev/null 2>&1
+                sleep 1
+                DN_SSH "raptorctl ric mode day" </dev/null > /dev/null 2>&1
+                sleep 2
+                LOW=1
+                for v in $(printf '%s\n' "$DN_LEDVALS" | DN_SSH sh -s -- $NIGHT_SET); do
+                    [ "$v" = "0" ] || LOW=0
+                done
+                [ "$LOW" = 1 ] &&
+                    ok "daynight: forced day re-asserts perturbed rails" ||
+                    bad "daynight: forced day re-asserts perturbed rails" \
+                        "gpio $NIGHT_SET still high after mode day"
+                DN_SSH "raptorctl ric ir850 off 2>/dev/null; raptorctl ric ir940 off 2>/dev/null; true" </dev/null > /dev/null 2>&1
+            fi
+            DN_SSH "raptorctl ric mode auto" </dev/null | grep -q '"mode":[[:space:]]*"auto"' &&
+                ok "daynight: back to auto" || bad "daynight: back to auto" "verb failed"
+
+            # ── real light transitions ──
+            eval "$LIGHTS_ON_CMD" > /dev/null 2>&1
+            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- day 90)
+            case "$R" in
+            OK*) ok "daynight: lit room settles to day ($(echo "$R" | cut -d' ' -f2)s)" ;;
+            *) bad "daynight: lit room settles to day" "$R" ;;
+            esac
+
+            eval "$LIGHTS_OFF_CMD" > /dev/null 2>&1
+            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- night 45)
+            case "$R" in
+            OK*)
+                DUSK_T=$(echo "$R" | cut -d' ' -f2)
+                DARK_CEIL=$(echo "$R" | cut -d' ' -f3)
+                ok "daynight: dusk reaches night (${DUSK_T}s)"
+                sleep 4
+                NG=$(DN_SSH "raptorctl ric status" </dev/null |
+                    sed -n 's/.*"total_gain":\([0-9]*\).*/\1/p')
+                # Photon check: IR light on a close scene must pull AE well
+                # under the dark no-IR ceiling seen seconds earlier.
+                if [ -n "$NIGHT_SET" ] && [ -n "$NG" ] && [ -n "$DARK_CEIL" ] &&
+                    [ "$DARK_CEIL" -gt 0 ]; then
+                    if [ "$NG" -lt $((DARK_CEIL * 80 / 100)) ]; then
+                        ok "daynight: IR emitters light the scene (gain $DARK_CEIL -> $NG)"
+                    else
+                        bad "daynight: IR emitters light the scene" \
+                            "gain $NG vs dark ceiling $DARK_CEIL: LEDs driven but dark?"
+                    fi
+                fi
+                ;;
+            *) bad "daynight: dusk reaches night" "$R" ;;
+            esac
+
+            R=$(printf '%s\n' "$DN_HOLD" | DN_SSH sh -s -- 45 $NIGHT_SET)
+            HN=$(echo "$R" | cut -d' ' -f1)
+            HF=$(echo "$R" | cut -d' ' -f2)
+            HL=$(echo "$R" | cut -d' ' -f3)
+            if [ "${HF:-1}" = 0 ] && [ "${HL:-1}" = 0 ] && [ "${HN:-0}" -ge 10 ]; then
+                ok "daynight: dark hold stable ($HN samples, 0 flaps, 0 LED blinks)"
+            else
+                bad "daynight: dark hold stable" \
+                    "samples=$HN flaps=$HF led-off-samples=$HL"
+            fi
+
+            PROBE_BEFORE=$(DN_SSH "logread 2>/dev/null | grep -c 'ambient probe'" </dev/null)
+            eval "$LIGHTS_ON_CMD" > /dev/null 2>&1
+            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- day 90)
+            case "$R" in
+            OK*)
+                DAWN_T=$(echo "$R" | cut -d' ' -f2)
+                PROBE_AFTER=$(DN_SSH "logread 2>/dev/null | grep -c 'ambient probe'" </dev/null)
+                VIA="ratio"
+                [ "${PROBE_AFTER:-0}" -gt "${PROBE_BEFORE:-0}" ] && VIA="probe"
+                ok "daynight: dawn returns to day (${DAWN_T}s via $VIA)"
+                if [ -n "$NIGHT_SET" ]; then
+                    LOW=1
+                    for v in $(printf '%s\n' "$DN_LEDVALS" | DN_SSH sh -s -- $NIGHT_SET); do
+                        [ "$v" = "0" ] || LOW=0
+                    done
+                    [ "$LOW" = 1 ] &&
+                        ok "daynight: dawn leaves the IR bank off" ||
+                        bad "daynight: dawn leaves the IR bank off" "gpio $NIGHT_SET still high"
+                fi
+                ;;
+            *) bad "daynight: dawn returns to day" "$R" ;;
+            esac
+
+            eval "$LIGHTS_OFF_CMD" > /dev/null 2>&1
+            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- night 45)
+            case "$R" in
+            OK*) ok "daynight: second dusk repeats ($(echo "$R" | cut -d' ' -f2)s)" ;;
+            *) bad "daynight: second dusk repeats" "$R" ;;
+            esac
+
+            # Dark re-acquisition: force day in darkness, release to auto,
+            # and the trigger must find its way back -- the daemon-level
+            # stand-in for a camera that boots at night.
+            DN_SSH "raptorctl ric mode day" </dev/null > /dev/null 2>&1
+            sleep 2
+            DN_SSH "raptorctl ric mode auto" </dev/null > /dev/null 2>&1
+            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- night 45)
+            case "$R" in
+            OK*) ok "daynight: dark re-acquisition after forced day ($(echo "$R" | cut -d' ' -f2)s)" ;;
+            *) bad "daynight: dark re-acquisition after forced day" "$R" ;;
+            esac
+
+            eval "$LIGHTS_ON_CMD" > /dev/null 2>&1
+            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- day 90)
+            case "$R" in
+            OK*) ok "daynight: lights restored, day again ($(echo "$R" | cut -d' ' -f2)s)" ;;
+            *) bad "daynight: lights restored, day again" "$R" ;;
+            esac
+        fi
+    fi
+}
+
+# Solo mode: just the day/night hardware cycle, no stream battery.
+# For quick IR/ircut iteration on the bench:
+#   raptor-test --daynight-only --ssh root@cam \
+#       --lights-on '<cmd>' --lights-off '<cmd>'
+if [ "${DAYNIGHT_ONLY:-0}" = 1 ]; then
+    echo "=== Day/night hardware cycle (solo) ==="
+    daynight_cycle
+    print_result
+fi
+
 
 # Legs that deliberately disturb the stream everything else
 # depends on: always the last thing the suite does, in every
@@ -1645,223 +1879,7 @@ fi
 # darkness (the emitter actually lit the scene -- a dead LED leaves
 # gain pinned at the dark ceiling). Bench-only: needs room lighting
 # the suite can switch.
-if [ "$DAYNIGHT" = 1 ]; then
-    if [ -z "$SSH_TARGET" ] || [ -z "$LIGHTS_ON_CMD" ] || [ -z "$LIGHTS_OFF_CMD" ]; then
-        skip "daynight cycle (needs --ssh, --lights-on and --lights-off)"
-    else
-        DN_SSH() { ssh -o ConnectTimeout=8 "$SSH_TARGET" "$@"; }
-        # Remote: wait for a state, tracking the max gain seen on the way
-        # (the pre-night dark ceiling feeds the photon check). One ssh per
-        # leg, not one per poll.
-        DN_WAIT='
-state=$1; budget=$2
-t0=$(date +%s); maxgain=0
-while :; do
-    s=$(raptorctl ric status 2>/dev/null)
-    g=$(printf %s "$s" | sed -n "s/.*\"total_gain\":\([0-9]*\).*/\1/p")
-    [ -n "$g" ] && [ "$g" -gt "$maxgain" ] && maxgain=$g
-    case "$s" in *"\"state\":\"$state\""*)
-        echo "OK $(( $(date +%s)-t0 )) $maxgain"; exit 0;; esac
-    [ $(( $(date +%s)-t0 )) -ge "$budget" ] && { echo "TIMEOUT $budget $maxgain"; exit 1; }
-    sleep 2
-done'
-        DN_HOLD='
-secs=$1; shift
-t0=$(date +%s); flaps=0; ledoff=0; n=0
-while [ $(( $(date +%s)-t0 )) -lt "$secs" ]; do
-    s=$(raptorctl ric status 2>/dev/null); n=$((n+1))
-    case "$s" in *"\"state\":\"night\""*) ;; *) flaps=$((flaps+1));; esac
-    for p in "$@"; do
-        v=$(cat /sys/class/gpio/gpio"$p"/value 2>/dev/null)
-        [ "$v" = "0" ] && ledoff=$((ledoff+1))
-    done
-    sleep 3
-done
-echo "$n $flaps $ledoff"'
-        DN_LEDVALS='for p in "$@"; do cat /sys/class/gpio/gpio"$p"/value 2>/dev/null || echo "?"; done'
-
-        DN_STATUS=$(DN_SSH "raptorctl ric status" 2>/dev/null)
-        if ! echo "$DN_STATUS" | grep -q '"state"'; then
-            bad "daynight: ric status" "no parsable status: ${DN_STATUS:-empty}"
-        elif ! echo "$DN_STATUS" | grep -q '"mode":[[:space:]]*"auto"'; then
-            bad "daynight: ric in auto mode" "$DN_STATUS"
-        else
-            ok "daynight: ric answering in auto mode"
-            # IR LED pins from the board's hardware map (not raptor config)
-            IR_PINS=$(DN_SSH 'jct /etc/thingino.json get gpio.ir850 2>/dev/null; jct /etc/thingino.json get gpio.ir940 2>/dev/null' </dev/null | grep -E '^[0-9]+$' | tr '\n' ' ')
-            # ── manual verbs ──
-            MV=$(DN_SSH "raptorctl ric mode night" </dev/null)
-            sleep 2
-            NIGHT_SET=""
-            if [ -n "$IR_PINS" ]; then
-                i=0
-                for v in $(printf '%s\n' "$DN_LEDVALS" | DN_SSH sh -s -- $IR_PINS); do
-                    i=$((i + 1))
-                    pin=$(echo "$IR_PINS" | cut -d' ' -f$i)
-                    [ "$v" = "1" ] && NIGHT_SET="$NIGHT_SET $pin"
-                done
-                NIGHT_SET=${NIGHT_SET# }
-                if [ -n "$NIGHT_SET" ]; then
-                    ok "daynight: forced night lights an IR bank (gpio $NIGHT_SET)"
-                else
-                    bad "daynight: forced night lights an IR bank" \
-                        "pins $IR_PINS all low after mode night"
-                fi
-            else
-                skip "daynight: IR LED rail checks (no IR pins in thingino.json)"
-            fi
-            echo "$MV" | grep -q '"state":[[:space:]]*"night"' &&
-                ok "daynight: mode night forces night" ||
-                bad "daynight: mode night forces night" "$MV"
-            MV=$(DN_SSH "raptorctl ric mode day" </dev/null)
-            sleep 2
-            echo "$MV" | grep -q '"state":[[:space:]]*"day"' &&
-                ok "daynight: mode day forces day" ||
-                bad "daynight: mode day forces day" "$MV"
-            if [ -n "$NIGHT_SET" ]; then
-                LOW=1
-                for v in $(printf '%s\n' "$DN_LEDVALS" | DN_SSH sh -s -- $NIGHT_SET); do
-                    [ "$v" = "0" ] || LOW=0
-                done
-                [ "$LOW" = 1 ] &&
-                    ok "daynight: forced day cuts the IR bank" ||
-                    bad "daynight: forced day cuts the IR bank" "gpio $NIGHT_SET not all low"
-            fi
-            for bank in ir850 ir940; do
-                RC=$(DN_SSH "raptorctl ric $bank on" </dev/null)
-                case "$RC" in
-                *'"status":"ok"'*)
-                    DN_SSH "raptorctl ric $bank off" </dev/null > /dev/null 2>&1
-                    ok "daynight: manual $bank on/off" ;;
-                *"no $bank pin"*)
-                    skip "daynight: manual $bank (no pin on this board)" ;;
-                *)
-                    bad "daynight: manual $bank" "$RC" ;;
-                esac
-            done
-            DN_SSH "raptorctl ric ircut night" </dev/null | grep -q '"status":"ok"' &&
-                DN_SSH "raptorctl ric ircut day" </dev/null | grep -q '"status":"ok"' &&
-                ok "daynight: manual ircut night/day" ||
-                bad "daynight: manual ircut night/day" "drive rejected"
-            # Perturbed rails must yield to a forced mode: bench verbs move
-            # hardware without touching the daemon's bookkeeping, and a
-            # force that matches the bookkept state must still drive (the
-            # Wyze V3 silent-no-op bug). Only the auto-managed bank is
-            # asserted low: a manually lit disabled bank staying lit is
-            # documented manual-beats-automatic behavior.
-            if [ -n "$NIGHT_SET" ]; then
-                DN_SSH "raptorctl ric ir850 on 2>/dev/null; raptorctl ric ir940 on 2>/dev/null; raptorctl ric ircut night" </dev/null > /dev/null 2>&1
-                sleep 1
-                DN_SSH "raptorctl ric mode day" </dev/null > /dev/null 2>&1
-                sleep 2
-                LOW=1
-                for v in $(printf '%s\n' "$DN_LEDVALS" | DN_SSH sh -s -- $NIGHT_SET); do
-                    [ "$v" = "0" ] || LOW=0
-                done
-                [ "$LOW" = 1 ] &&
-                    ok "daynight: forced day re-asserts perturbed rails" ||
-                    bad "daynight: forced day re-asserts perturbed rails" \
-                        "gpio $NIGHT_SET still high after mode day"
-                DN_SSH "raptorctl ric ir850 off 2>/dev/null; raptorctl ric ir940 off 2>/dev/null; true" </dev/null > /dev/null 2>&1
-            fi
-            DN_SSH "raptorctl ric mode auto" </dev/null | grep -q '"mode":[[:space:]]*"auto"' &&
-                ok "daynight: back to auto" || bad "daynight: back to auto" "verb failed"
-
-            # ── real light transitions ──
-            eval "$LIGHTS_ON_CMD" > /dev/null 2>&1
-            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- day 90)
-            case "$R" in
-            OK*) ok "daynight: lit room settles to day ($(echo "$R" | cut -d' ' -f2)s)" ;;
-            *) bad "daynight: lit room settles to day" "$R" ;;
-            esac
-
-            eval "$LIGHTS_OFF_CMD" > /dev/null 2>&1
-            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- night 45)
-            case "$R" in
-            OK*)
-                DUSK_T=$(echo "$R" | cut -d' ' -f2)
-                DARK_CEIL=$(echo "$R" | cut -d' ' -f3)
-                ok "daynight: dusk reaches night (${DUSK_T}s)"
-                sleep 4
-                NG=$(DN_SSH "raptorctl ric status" </dev/null |
-                    sed -n 's/.*"total_gain":\([0-9]*\).*/\1/p')
-                # Photon check: IR light on a close scene must pull AE well
-                # under the dark no-IR ceiling seen seconds earlier.
-                if [ -n "$NIGHT_SET" ] && [ -n "$NG" ] && [ -n "$DARK_CEIL" ] &&
-                    [ "$DARK_CEIL" -gt 0 ]; then
-                    if [ "$NG" -lt $((DARK_CEIL * 80 / 100)) ]; then
-                        ok "daynight: IR emitters light the scene (gain $DARK_CEIL -> $NG)"
-                    else
-                        bad "daynight: IR emitters light the scene" \
-                            "gain $NG vs dark ceiling $DARK_CEIL: LEDs driven but dark?"
-                    fi
-                fi
-                ;;
-            *) bad "daynight: dusk reaches night" "$R" ;;
-            esac
-
-            R=$(printf '%s\n' "$DN_HOLD" | DN_SSH sh -s -- 45 $NIGHT_SET)
-            HN=$(echo "$R" | cut -d' ' -f1)
-            HF=$(echo "$R" | cut -d' ' -f2)
-            HL=$(echo "$R" | cut -d' ' -f3)
-            if [ "${HF:-1}" = 0 ] && [ "${HL:-1}" = 0 ] && [ "${HN:-0}" -ge 10 ]; then
-                ok "daynight: dark hold stable ($HN samples, 0 flaps, 0 LED blinks)"
-            else
-                bad "daynight: dark hold stable" \
-                    "samples=$HN flaps=$HF led-off-samples=$HL"
-            fi
-
-            PROBE_BEFORE=$(DN_SSH "logread 2>/dev/null | grep -c 'ambient probe'" </dev/null)
-            eval "$LIGHTS_ON_CMD" > /dev/null 2>&1
-            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- day 90)
-            case "$R" in
-            OK*)
-                DAWN_T=$(echo "$R" | cut -d' ' -f2)
-                PROBE_AFTER=$(DN_SSH "logread 2>/dev/null | grep -c 'ambient probe'" </dev/null)
-                VIA="ratio"
-                [ "${PROBE_AFTER:-0}" -gt "${PROBE_BEFORE:-0}" ] && VIA="probe"
-                ok "daynight: dawn returns to day (${DAWN_T}s via $VIA)"
-                if [ -n "$NIGHT_SET" ]; then
-                    LOW=1
-                    for v in $(printf '%s\n' "$DN_LEDVALS" | DN_SSH sh -s -- $NIGHT_SET); do
-                        [ "$v" = "0" ] || LOW=0
-                    done
-                    [ "$LOW" = 1 ] &&
-                        ok "daynight: dawn leaves the IR bank off" ||
-                        bad "daynight: dawn leaves the IR bank off" "gpio $NIGHT_SET still high"
-                fi
-                ;;
-            *) bad "daynight: dawn returns to day" "$R" ;;
-            esac
-
-            eval "$LIGHTS_OFF_CMD" > /dev/null 2>&1
-            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- night 45)
-            case "$R" in
-            OK*) ok "daynight: second dusk repeats ($(echo "$R" | cut -d' ' -f2)s)" ;;
-            *) bad "daynight: second dusk repeats" "$R" ;;
-            esac
-
-            # Dark re-acquisition: force day in darkness, release to auto,
-            # and the trigger must find its way back -- the daemon-level
-            # stand-in for a camera that boots at night.
-            DN_SSH "raptorctl ric mode day" </dev/null > /dev/null 2>&1
-            sleep 2
-            DN_SSH "raptorctl ric mode auto" </dev/null > /dev/null 2>&1
-            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- night 45)
-            case "$R" in
-            OK*) ok "daynight: dark re-acquisition after forced day ($(echo "$R" | cut -d' ' -f2)s)" ;;
-            *) bad "daynight: dark re-acquisition after forced day" "$R" ;;
-            esac
-
-            eval "$LIGHTS_ON_CMD" > /dev/null 2>&1
-            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- day 90)
-            case "$R" in
-            OK*) ok "daynight: lights restored, day again ($(echo "$R" | cut -d' ' -f2)s)" ;;
-            *) bad "daynight: lights restored, day again" "$R" ;;
-            esac
-        fi
-    fi
-fi
+[ "$DAYNIGHT" = 1 ] && daynight_cycle
 
 # ── 8. mpv: real player over both transports ──
 mpv_check() {
