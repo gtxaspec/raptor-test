@@ -1,4 +1,17 @@
 #!/bin/bash
+
+# Run from a private copy: editing this file while a battery is live
+# corrupts the running interpreter's parse (bash reads incrementally).
+if [ -z "${RUN_BATTERY_SELF:-}" ]; then
+    RUN_BATTERY_HOME="$(cd "$(dirname "$0")" && pwd)"
+    export RUN_BATTERY_HOME
+    RUN_BATTERY_SELF=$(mktemp "${TMPDIR:-/tmp}/run-battery.XXXXXX")
+    export RUN_BATTERY_SELF
+    cp "$0" "$RUN_BATTERY_SELF"
+    cd "$RUN_BATTERY_HOME"
+    exec /bin/bash "$RUN_BATTERY_SELF" "$@"
+fi
+
 # run-battery -- run the full raptor-test battery consistently across
 # every backend a target exposes, from a targets/<name>.conf manifest.
 #
@@ -45,6 +58,14 @@ case "$1" in
     -h|--help) usage 0 ;;
     --list) list_targets; exit 0 ;;
 esac
+
+# Every battery keeps its own complete transcript: one careless pipe on
+# the invoking side must never be able to lose the per-leg results
+# again (a tail -30 once ate five failure identities).
+mkdir -p "$DIR/battery-logs"
+BATTERY_LOG="$DIR/battery-logs/$(echo "$1" | tr -d '-' | tr '/' '_')-$(date +%Y%m%d-%H%M%S).log"
+exec > >(tee -a "$BATTERY_LOG") 2>&1
+echo "# full transcript: $BATTERY_LOG"
 
 # --backend <substr>: run only the pass(es) whose matrix label matches.
 # Everything else is recorded as skipped, so the matrix stays complete.
@@ -428,6 +449,8 @@ battery_for_target() {
     # attached to the main pass. Needs ssh to reach raptorctl.
     if [ -n "${LIGHTS_ON_CMD:-}" ] && [ -n "${LIGHTS_OFF_CMD:-}" ] && [ -n "$SSH" ]; then
         rsd_args+=(--daynight --lights-on "$LIGHTS_ON_CMD" --lights-off "$LIGHTS_OFF_CMD")
+        [ -n "${BENCH_QUIESCE_CMD:-}" ] && rsd_args+=(--bench-quiesce "$BENCH_QUIESCE_CMD")
+        [ -n "${BENCH_RESTORE_CMD:-}" ] && rsd_args+=(--bench-restore "$BENCH_RESTORE_CMD")
     fi
     [ -n "$TLS" ]  && rsd_args+=(--tls "$TLS")
     [ -n "$RTMP" ] && rsd_args+=(--rtmp "$RTMP")

@@ -65,6 +65,11 @@ Options:
                        URL needed (daemons must already be running)
   --lights-on <cmd>    shell command that turns the room lights on
   --lights-off <cmd>   shell command that turns the room lights off
+  --bench-quiesce <c>  run before the daynight cycle: neutralize OTHER
+                       bench cameras (their auto-night IR floods the
+                       room and fakes a lit scene). --bench-restore
+                       runs when the cycle ends.
+  --bench-restore <c>  see --bench-quiesce
   --json <file>        also write one JSON record per check (JSONL)
   --fps-tol <frac>     video fps tolerance vs nominal (default 0.15)
   --drift-ppm <n>      audio cadence drift ceiling in ppm (default 3000)
@@ -128,6 +133,8 @@ SRT_PASSPHRASE=""
 DRIFT_SECS=30
 DAYNIGHT=0
 DAYNIGHT_ONLY=0
+BENCH_QUIESCE_CMD=""
+BENCH_RESTORE_CMD=""
 LIGHTS_ON_CMD=""
 LIGHTS_OFF_CMD=""
 while [ $# -gt 0 ]; do
@@ -135,6 +142,8 @@ while [ $# -gt 0 ]; do
     --sub) SUB_URL=$2; shift 2 ;;
     --ssh) SSH_TARGET=$2; shift 2 ;;
     --daynight) DAYNIGHT=1; shift ;;
+    --bench-quiesce) BENCH_QUIESCE_CMD=$2; shift 2 ;;
+    --bench-restore) BENCH_RESTORE_CMD=$2; shift 2 ;;
     --daynight-only) DAYNIGHT=1; DAYNIGHT_ONLY=1; shift ;;
     --lights-on) LIGHTS_ON_CMD=$2; shift 2 ;;
     --lights-off) LIGHTS_OFF_CMD=$2; shift 2 ;;
@@ -328,6 +337,10 @@ echo "$n $flaps $ledoff"'
             bad "daynight: ric in auto mode" "$DN_STATUS"
         else
             ok "daynight: ric answering in auto mode"
+            # Other bench cameras in auto go night when the room darkens
+            # and their IR floods the scene (a Wyze V2 lit the V3's
+            # "dark" re-acquisition to gain 441). Quiesce them first.
+            [ -n "$BENCH_QUIESCE_CMD" ] && eval "$BENCH_QUIESCE_CMD" > /dev/null 2>&1
             # IR LED pins from the board's hardware map (not raptor config)
             IR_PINS=$(DN_SSH 'jct /etc/thingino.json get gpio.ir850 2>/dev/null; jct /etc/thingino.json get gpio.ir940 2>/dev/null' </dev/null | grep -E '^[0-9]+$' | tr '\n' ' ')
             # ── manual verbs ──
@@ -508,6 +521,7 @@ echo "$n $flaps $ledoff"'
             *) bad "daynight: lights restored, day again" "$R" ;;
             esac
             DN_SSH "raptorctl ric set-threshold probe_recheck_sec 600" </dev/null > /dev/null 2>&1
+            [ -n "$BENCH_RESTORE_CMD" ] && eval "$BENCH_RESTORE_CMD" > /dev/null 2>&1
         fi
     fi
 }
@@ -1938,9 +1952,15 @@ fi
 if [ "$AUDIO_ONLY" = 1 ]; then
     skip "join contract (audio-only source)"
 else
-    "$FFPROBE" -v error -rtsp_transport tcp -select_streams v \
-        -show_packets -show_data -read_intervals %+1 "$URL" \
-        >"$WORK/join_pkts.txt" 2>/dev/null
+    # One retry: under full-battery load on wifi targets, session setup
+    # alone can eat the probe window and return zero packets.
+    for JC_TRY in 1 2; do
+        "$FFPROBE" -v error -rtsp_transport tcp -select_streams v \
+            -show_packets -show_data -read_intervals %+1 "$URL" \
+            >"$WORK/join_pkts.txt" 2>/dev/null
+        [ "$(grep -c '^\[PACKET\]' "$WORK/join_pkts.txt")" -ge 5 ] && break
+        sleep 2
+    done
     JOIN_VERDICT=$(python3 - "${VCODEC:-h264}" <"$WORK/join_pkts.txt" <<'PYEOF'
 import sys
 
