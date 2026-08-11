@@ -423,6 +423,12 @@ battery_for_target() {
     # flag existed and the battery never passed it, so every run has
     # been reporting a clean matrix with the fuzzer sitting out.
     rsd_args+=(--fuzz)
+    # Day/night hardware cycle: bench targets that can switch the room
+    # lights declare the commands in their conf; one cycle per battery,
+    # attached to the main pass. Needs ssh to reach raptorctl.
+    if [ -n "${LIGHTS_ON_CMD:-}" ] && [ -n "${LIGHTS_OFF_CMD:-}" ] && [ -n "$SSH" ]; then
+        rsd_args+=(--daynight --lights-on "$LIGHTS_ON_CMD" --lights-off "$LIGHTS_OFF_CMD")
+    fi
     [ -n "$TLS" ]  && rsd_args+=(--tls "$TLS")
     [ -n "$RTMP" ] && rsd_args+=(--rtmp "$RTMP")
     [ -n "$WEBRTC" ] && rsd_args+=(--webrtc "$WEBRTC")
