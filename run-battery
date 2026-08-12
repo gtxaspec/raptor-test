@@ -34,7 +34,7 @@ fi
 # is always the caller's job. See targets/README.md.
 set -u
 
-DIR="$(cd "$(dirname "$0")" && pwd)"
+DIR="${RUN_BATTERY_HOME:-$(cd "$(dirname "$0")" && pwd)}"
 TDIR="$DIR/targets"
 SUITE="$DIR/raptor-test"
 
