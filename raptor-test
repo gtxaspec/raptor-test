@@ -1957,11 +1957,11 @@ else
     # legitimately wait most of a GOP for its first packet (3s at 20fps
     # with gop 60 on a loaded HEVC target), and session setup alone can
     # eat a short window on wifi under full-battery load.
-    for JC_TRY in 1 2; do
+    for JC_TRY in 1 2 3; do
         "$FFPROBE" -v error -rtsp_transport tcp -select_streams v \
             -analyzeduration 500000 -probesize 500000 \
             -show_packets -show_data -read_intervals %+4 "$URL" \
-            >"$WORK/join_pkts.txt" 2>/dev/null
+            >"$WORK/join_pkts.txt" 2>"$WORK/join_pkts.err"
         [ "$(grep -c '^\[PACKET\]' "$WORK/join_pkts.txt")" -ge 5 ] && break
         sleep 2
     done
@@ -2025,7 +2025,7 @@ PYEOF
 )
     case "$JOIN_VERDICT" in
     OK*) ok "join contract: ${JOIN_VERDICT#OK }" ;;
-    *) bad "join contract" "${JOIN_VERDICT#FAIL }" ;;
+    *) bad "join contract" "${JOIN_VERDICT#FAIL } | ffprobe: $(tail -1 "$WORK/join_pkts.err" 2>/dev/null | cut -c1-120)" ;;
     esac
 fi
 
