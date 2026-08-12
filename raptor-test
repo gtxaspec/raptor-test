@@ -63,6 +63,14 @@ Options:
                        room lighting only)
   --daynight-only      run ONLY the day/night cycle and exit; no rtsp
                        URL needed (daemons must already be running)
+  --only <regex>       run only suite sections whose key matches. Keys:
+                       signaling auth transports wire sessions avts drift
+                       content rfc restream concurrency regression kill
+                       health mpv join ortsp slow backchannel mjpeg
+                       (+ flag-gated: soak fuzz daynight rhd srt tls rtmp
+                       webrtc frigate reccheck). Some legs derive context
+                       (e.g. codec) from earlier sections and fall back
+                       to defaults when those are skipped.
   --lights-on <cmd>    shell command that turns the room lights on
   --lights-off <cmd>   shell command that turns the room lights off
   --bench-quiesce <c>  run before the daynight cycle: neutralize OTHER
@@ -134,6 +142,17 @@ SRT_PASSPHRASE=""
 DRIFT_SECS=30
 DAYNIGHT=0
 DAYNIGHT_ONLY=0
+ONLY=""
+
+# --only <regex>: section gate. Runtime sections sit in `if want <key>`
+# blocks; unset ONLY runs everything.
+want() {
+    [ -z "$ONLY" ] && return 0
+    echo "$1" | grep -qE "$ONLY"
+}
+# Cross-section context normally set inside wrapped sections; safe
+# defaults keep --only subsets runnable under set -u.
+AUDIO_ONLY=0
 BENCH_QUIESCE_CMD=""
 BENCH_RESTORE_CMD=""
 LIGHTS_ON_CMD=""
@@ -143,6 +162,7 @@ while [ $# -gt 0 ]; do
     --sub) SUB_URL=$2; shift 2 ;;
     --ssh) SSH_TARGET=$2; shift 2 ;;
     --daynight) DAYNIGHT=1; shift ;;
+    --only) ONLY=$2; shift 2 ;;
     --bench-quiesce) BENCH_QUIESCE_CMD=$2; shift 2 ;;
     --bench-restore) BENCH_RESTORE_CMD=$2; shift 2 ;;
     --daynight-only) DAYNIGHT=1; DAYNIGHT_ONLY=1; shift ;;
@@ -768,6 +788,44 @@ trap cleanup EXIT
 # show_errs <log> — print the matched error lines, indented.
 show_errs() { grep -iE "$ERRPAT" "$1" | sort | uniq -c | sort -rn | head -3 | sed 's/^/          /'; }
 
+# clip_verify <name> <file> — a recorded clip must have sane streams,
+# matching durations, and decode with zero errors.
+clip_verify() {
+    local name=$1 f=$2
+    local slug
+    slug=$(echo "$name" | tr -c 'A-Za-z0-9._-' '_')
+    if [ ! -s "$f" ]; then
+        bad "$name" "no file"
+        return
+    fi
+    local info vdur adur
+    info=$("$FFPROBE" -v error -show_entries stream=codec_type,duration -of csv=p=0 "$f" 2>/dev/null)
+    vdur=$(echo "$info" | grep '^video' | cut -d, -f2 | cut -d. -f1)
+    adur=$(echo "$info" | grep '^audio' | cut -d, -f2 | cut -d. -f1)
+    "$FFMPEG" -nostdin -v error -i "$f" -f null - >"$WORK/$slug.decode.log" 2>&1
+    local derr
+    # The null muxer re-times to 1/1000 and nags about colliding dts
+    # (wallclock-stamped recorders collide for real under bursty WiFi
+    # arrival); drop the nag AND its "Last message repeated" tails.
+    derr=$(grep -viE 'non monotonically increasing dts to muxer|Last message repeated' \
+        "$WORK/$slug.decode.log" | grep -c .)
+    # File-level timestamp truth instead: dts must never move backward.
+    local vback
+    vback=$("$FFPROBE" -v error -select_streams v -show_entries packet=dts -of csv=p=0 "$f" 2>/dev/null |
+        awk 'NR>1 && $1+0 < prev+0 {n++} {prev=$1} END {print n+0}')
+    if [ -z "$vdur" ]; then
+        bad "$name" "no video stream"
+    elif [ "${derr:-1}" -gt 0 ]; then
+        bad "$name" "decode errors, see $WORK/$slug.decode.log"
+    elif [ "${vback:-0}" -gt 0 ]; then
+        bad "$name" "video dts moves backward $vback times in the file"
+    elif [ -n "$adur" ] && { [ $((vdur - adur)) -gt 1 ] || [ $((adur - vdur)) -gt 1 ]; }; then
+        bad "$name" "duration mismatch v=${vdur}s a=${adur}s"
+    else
+        ok "$name (v=${vdur}s a=${adur:-none}s, decode clean)"
+    fi
+}
+
 # capture <name> <seconds> <url> [transport] — run a decoding client,
 # fail if any error-class line appears.
 capture() {
@@ -793,6 +851,7 @@ echo "=== raptor-test: $URL ==="
 echo "    client: $("$FFMPEG" -version 2>/dev/null | head -1 | grep -oE 'version [^ ]+' || echo unknown) ($FFMPEG)"
 echo "    logs: $WORK"
 
+if want "signaling"; then
 # ── 1. Signaling (DESCRIBE) ──
 SDP=$(python3 - "$PROBES" "$HOST" "$PORT" "$RPATH" "${RTSP_USER:-}" "${RTSP_PASS:-}" <<'EOF'
 import sys
@@ -817,6 +876,8 @@ else
     bad "SDP: no media tracks advertised"
 fi
 
+fi
+if want "auth"; then
 # ── 1b. Auth battery (--user/--pass): the machinery must challenge,
 # reject, accept, and enforce ──
 if [ -n "$RTSP_USER" ]; then
@@ -882,6 +943,8 @@ else
     skip "SDP AAC checks (no mpeg4-generic audio advertised)"
 fi
 
+fi
+if want "soak"; then
 # ── 1b. Soak mode (--soak): endurance instead of the battery ──
 if [ -n "$SOAK_MIN" ]; then
     DEADLINE=$(( $(date +%s) + SOAK_MIN * 60 ))
@@ -941,6 +1004,8 @@ if [ -n "$SOAK_MIN" ]; then
     print_result
 fi
 
+fi
+if want "transports"; then
 # ── 2. Transport matrix ──
 if capture tcp_main "$DUR" "$URL" tcp; then ok "TCP: clean media (${DUR}s)"; else bad "TCP: clean media" "see below"; show_errs "$WORK/tcp_main.log"; fi
 if capture udp_main "$DUR" "$URL"; then ok "UDP: clean media (${DUR}s)"; else bad "UDP: clean media" "see below"; show_errs "$WORK/udp_main.log"; fi
@@ -948,6 +1013,8 @@ if [ "$SUB_URL" != "$URL" ]; then
     if capture udp_sub "$DUR" "$SUB_URL"; then ok "UDP sub-stream: clean media"; else bad "UDP sub-stream" "see below"; show_errs "$WORK/udp_sub.log"; fi
 fi
 
+fi
+if want "wire"; then
 # ── 3. Wire-level RTP continuity (raw TCP-interleaved probe) ──
 python3 "$PROBES/seq_gap.py" "$HOST" "$PORT" "$RPATH" 15 ${RTSP_USER:+"$RTSP_USER" "$RTSP_PASS"} >"$WORK/seqgap.txt" 2>&1
 GAPRPT=$(head -1 "$WORK/seqgap.txt")
@@ -1007,6 +1074,8 @@ if [ -n "$MAXRTP" ]; then
     fi
 fi
 
+fi
+if want "sessions"; then
 # ── 3b. Session lifecycle: silent-client reaping, transport re-SETUP ──
 if [ "$CORE" = 1 ]; then
     skip "session lifecycle (core mode)"
@@ -1031,6 +1100,8 @@ while IFS= read -r line; do
 done <<< "$REAPRPT"
 fi
 
+fi
+if want "avts"; then
 # ── 4. A/V timestamps in a real capture ──
 # -copyinkf: ffmpeg's streamcopy waits for a key-flagged packet per
 # stream, but its RTP AAC depacketizer never sets one (AAC is not
@@ -1075,6 +1146,8 @@ else
     bad "A/V capture timestamps" "capture produced only $VP video packets"
 fi
 
+fi
+if want "drift"; then
 # ── 4b. Audio cadence/drift (dedicated longer capture) ──
 # Drift needs a long lever arm: a device's audio sample clock can
 # wander hundreds of ppm over ~10s (measured on a T31 16k path), so a
@@ -1141,6 +1214,8 @@ else
     skip "audio drift (too few audio packets)"
 fi
 
+fi
+if want "content"; then
 # ── 4c. Decoded-content validation ──
 if [ "$VP" -gt 30 ]; then
     VMETA=$("$FFPROBE" -v error -select_streams v -show_entries stream=width,height,r_frame_rate -of csv=p=0 "$WORK/ts.mkv" 2>/dev/null | head -1)
@@ -1412,6 +1487,8 @@ if [ -n "$RAWFMT" ]; then
     fi
 fi
 
+fi
+if want "rfc"; then
 # ── 4d. RFC conformance (RFC 2326 / 4566 / 3550 / 3640) ──
 python3 "$PROBES/rfc_check.py" "$HOST" "$PORT" "$RPATH" 8 ${RTSP_USER:+"$RTSP_USER" "$RTSP_PASS"} >"$WORK/rfc.txt" 2>&1
 while IFS= read -r line; do
@@ -1422,6 +1499,8 @@ while IFS= read -r line; do
     esac
 done <"$WORK/rfc.txt"
 
+fi
+if want "fuzz"; then
 # ── 4e. RTSP parser fuzzing (--fuzz): malformed input, liveness-checked ──
 if [ "$FUZZ" = 1 ]; then
     FZ=$(timeout -k 5 100 python3 "$PROBES/fuzz_rtsp.py" "$HOST" "$PORT" 300 \
@@ -1701,6 +1780,8 @@ if [ "$CORE" = 1 ]; then
     print_result
 fi
 
+fi
+if want "concurrency"; then
 # ── 5a. Concurrency ladder: 2 -> 3 -> 4 simultaneous clients ──
 # concurrent_check <label> <url> <n> <secs>: n clients (alternating
 # TCP/UDP) run together; every one of them must come back clean.
@@ -1778,6 +1859,8 @@ else
     show_errs "$WORK/sustained.log"
 fi
 
+fi
+if want "regression"; then
 # ── 6. Regression: repeated default-transport probe sessions, then media ──
 for i in 1 2 3; do
     timeout -k 3 12 "$FFPROBE" -v quiet -show_streams "$URL" >/dev/null 2>&1
@@ -1800,6 +1883,8 @@ else
     fi
 fi
 
+fi
+if want "kill"; then
 # ── 6b. Abrupt-kill client: RST mid-stream must not wound the server ──
 timeout -k 3 20 "$FFMPEG" -nostdin -v quiet -rtsp_transport tcp -i "$URL" -f null - >/dev/null 2>&1 &
 KPID=$!
@@ -1815,6 +1900,8 @@ else
     show_errs "$WORK/after_kill.log"
 fi
 
+fi
+if want "health"; then
 # ── 7. Device health (raptor bench, --ssh) ──
 if [ -n "$SSH_TARGET" ]; then
     sleep 3
@@ -1895,6 +1982,8 @@ else
     skip "device health (--ssh not given)"
 fi
 
+fi
+if want "daynight"; then
 # ── 7c. Day/night hardware cycle (--daynight) ──
 # The x86 ric harness proves the transition logic against a stub rvd;
 # this section proves the real loop: ISP -> HAL exposure -> ric ->
@@ -1905,6 +1994,8 @@ fi
 # the suite can switch.
 [ "$DAYNIGHT" = 1 ] && daynight_cycle
 
+fi
+if want "mpv"; then
 # ── 8. mpv: real player over both transports ──
 mpv_check() {
     local name=$1 turl=$2
@@ -1940,6 +2031,8 @@ else
     skip "mpv (not installed)"
 fi
 
+fi
+if want "join"; then
 # ── 8d. Join contract: first video frame is a keyframe, pts chain sane ──
 # The server must hold new clients until a keyframe (rsd c7c0770):
 # orphan pre-IDR P-frames are concealed by live decoders but recorders
@@ -1960,18 +2053,24 @@ else
     for JC_TRY in 1 2 3; do
         "$FFPROBE" -v error -rtsp_transport tcp -select_streams v \
             -analyzeduration 500000 -probesize 500000 \
-            -show_packets -show_data -read_intervals %+4 "$URL" \
+            -show_streams -show_packets -show_data -read_intervals %+4 "$URL" \
             >"$WORK/join_pkts.txt" 2>"$WORK/join_pkts.err"
         [ "$(grep -c '^\[PACKET\]' "$WORK/join_pkts.txt")" -ge 5 ] && break
         sleep 2
     done
-    JOIN_VERDICT=$(python3 - "${VCODEC:-h264}" <"$WORK/join_pkts.txt" <<'PYEOF'
+    # NB: the packet dump is argv, not stdin. `python3 -` consumes stdin
+    # for the script itself, so a <file redirect here reads zero lines.
+    JOIN_VERDICT=$(python3 - "${VCODEC:-h264}" "$WORK/join_pkts.txt" <<'PYEOF'
 import sys
 
 codec = sys.argv[1]
 pkts, cur = [], None
-for line in sys.stdin:
+for line in open(sys.argv[2]):
     line = line.strip()
+    if line.startswith("codec_name="):
+        # -show_streams rides along so --only subsets need no earlier
+        # section to have detected the codec
+        codec = line.split("=", 1)[1] or codec
     if line == "[PACKET]":
         cur = {"pts": None, "hex": []}
     elif line == "[/PACKET]":
@@ -2029,6 +2128,8 @@ PYEOF
     esac
 fi
 
+fi
+if want "ortsp"; then
 # ── 8c. openRTSP: the live555 client stack (VLC's RTSP lineage) ──
 # ffmpeg and mpv share libav's RTSP; live555 negotiates and consumes
 # sessions differently, so it exercises server paths they cannot.
@@ -2062,44 +2163,9 @@ else
     skip "openRTSP (tools/openRTSP not built)"
 fi
 
-# clip_verify <name> <file> — a recorded clip must have sane streams,
-# matching durations, and decode with zero errors.
-clip_verify() {
-    local name=$1 f=$2
-    local slug
-    slug=$(echo "$name" | tr -c 'A-Za-z0-9._-' '_')
-    if [ ! -s "$f" ]; then
-        bad "$name" "no file"
-        return
-    fi
-    local info vdur adur
-    info=$("$FFPROBE" -v error -show_entries stream=codec_type,duration -of csv=p=0 "$f" 2>/dev/null)
-    vdur=$(echo "$info" | grep '^video' | cut -d, -f2 | cut -d. -f1)
-    adur=$(echo "$info" | grep '^audio' | cut -d, -f2 | cut -d. -f1)
-    "$FFMPEG" -nostdin -v error -i "$f" -f null - >"$WORK/$slug.decode.log" 2>&1
-    local derr
-    # The null muxer re-times to 1/1000 and nags about colliding dts
-    # (wallclock-stamped recorders collide for real under bursty WiFi
-    # arrival); drop the nag AND its "Last message repeated" tails.
-    derr=$(grep -viE 'non monotonically increasing dts to muxer|Last message repeated' \
-        "$WORK/$slug.decode.log" | grep -c .)
-    # File-level timestamp truth instead: dts must never move backward.
-    local vback
-    vback=$("$FFPROBE" -v error -select_streams v -show_entries packet=dts -of csv=p=0 "$f" 2>/dev/null |
-        awk 'NR>1 && $1+0 < prev+0 {n++} {prev=$1} END {print n+0}')
-    if [ -z "$vdur" ]; then
-        bad "$name" "no video stream"
-    elif [ "${derr:-1}" -gt 0 ]; then
-        bad "$name" "decode errors, see $WORK/$slug.decode.log"
-    elif [ "${vback:-0}" -gt 0 ]; then
-        bad "$name" "video dts moves backward $vback times in the file"
-    elif [ -n "$adur" ] && { [ $((vdur - adur)) -gt 1 ] || [ $((adur - vdur)) -gt 1 ]; }; then
-        bad "$name" "duration mismatch v=${vdur}s a=${adur}s"
-    else
-        ok "$name (v=${vdur}s a=${adur:-none}s, decode clean)"
-    fi
-}
 
+fi
+if want "slow"; then
 # ── 7b. Slow-client smoke: readers that never keep up must not stall
 #       or wound the server ──
 SLOWRPT=$(timeout -k 5 90 python3 "$PROBES/slow_client.py" "$HOST" "$PORT" "$RPATH" \
@@ -2111,6 +2177,8 @@ while IFS= read -r line; do
     esac
 done <<<"$SLOWRPT"
 
+fi
+if want "rhd"; then
 # ── 8a. RHD cold-start snapshots (--rhd --cold): must run before any
 #       other JPEG traffic, since a viewer holds the encoder up and
 #       leaves no cold path to test ──
@@ -2174,6 +2242,8 @@ if [ -n "$RHD_URL" ]; then
     fi
 fi
 
+fi
+if want "backchannel"; then
 # ── 8d. ONVIF backchannel: client -> server audio (auto-detected) ──
 # rsd advertises an a=sendonly audio section when [rtsp] backchannel
 # is enabled; the probe DESCRIBEs with the ONVIF Require header and,
@@ -2228,6 +2298,8 @@ else
     fi
 fi
 
+fi
+if want "mjpeg"; then
 # ── 8e. MJPEG over RTSP: the /jpeg endpoint (auto-detected) ──
 # Ring names (jpeg0/jpeg1) are not URL paths: rsd default endpoints
 # for the jpeg streams are /jpeg and /jpeg_sub.
@@ -2265,6 +2337,8 @@ fi
 
 restream_legs
 
+fi
+if want "srt"; then
 # ── 9c. SRT: MPEG-TS over SRT (rsr) (--srt) ──
 if [ -n "$SRT_URL" ]; then
     case "$SRT_URL" in srt://*) SU_BASE=$SRT_URL ;; *) SU_BASE="srt://$SRT_URL" ;; esac
@@ -2458,6 +2532,8 @@ EOF
     fi
 fi
 
+fi
+if want "tls"; then
 # ── 9d. RTSPS/TLS (--tls rtsps://host:port/path) ──
 if [ -n "$TLS_URL" ]; then
     THP=${TLS_URL#rtsps://}
@@ -2501,6 +2577,8 @@ EOF
     fi
 fi
 
+fi
+if want "rtmp"; then
 # ── 9e. RTMP push (--rtmp <listen-port>): rsp pushes to this host ──
 # The device's rsp must be configured with [push] url pointing at this
 # host: rtmp://<this-host>:<port>/live/raptortest (rsp reconnects every
@@ -2551,6 +2629,8 @@ if [ -n "$RTMP_PORT" ]; then
         'raptorctl -j "{\"daemon\":\"rsp\",\"cmd\":\"stop\"}"' >/dev/null 2>&1
 fi
 
+fi
+if want "webrtc"; then
 # ── 9f. WebRTC (--webrtc <whip-url>): real WHIP/ICE/DTLS-SRTP client ──
 # Measures decoded video framerate, stall stability, PTS discipline,
 # and that audio decodes to real samples. Video requires an H264
@@ -2597,6 +2677,8 @@ if [ -n "$WEBRTC_URL" ]; then
     fi
 fi
 
+fi
+if want "frigate"; then
 # ── 10. Frigate record + clip verification (--frigate, docker) ──
 if [ "$FRIGATE" = 1 ]; then
     if command -v docker >/dev/null 2>&1 && docker ps >/dev/null 2>&1; then
@@ -2663,6 +2745,8 @@ else
     skip "frigate leg (--frigate not given)"
 fi
 
+fi
+if want "reccheck"; then
 # ── 11. Recorded-clip check for an external recorder (--record-check) ──
 if [ -n "$RECDIR" ]; then
     # newest file is usually still being written; verify the previous one
@@ -2675,4 +2759,5 @@ fi
 
 
 late_legs
+fi
 print_result

@@ -400,6 +400,12 @@ battery_for_target() {
         OVERALL_FAIL=1
         return
     fi
+    # Ad-hoc env flags append AFTER the conf's own SUITE_EXTRA, so
+    # SUITE_EXTRA="--only join" ./run-battery <t> --backend rsd works
+    # on targets whose conf already declares flags (e.g. fps-tol).
+    if [ -n "$SUITE_EXTRA_ENV" ] && [ "$SUITE_EXTRA" != "$SUITE_EXTRA_ENV" ]; then
+        SUITE_EXTRA="$SUITE_EXTRA $SUITE_EXTRA_ENV"
+    fi
     CURRENT_TARGET=$name
 
     echo "================================================================"
