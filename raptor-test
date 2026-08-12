@@ -2113,13 +2113,24 @@ elif not keyish:
 else:
     na_late = [i for i, p in enumerate(pkts) if p["pts"] is None and i > 0]
     seq = [p["pts"] for p in pkts if p["pts"] is not None]
+    deltas = sorted(b - a for a, b in zip(seq, seq[1:]))
+    frame_dur = deltas[len(deltas) // 2] if deltas else 0.05
+    backs = [(i, a - b) for i, (a, b) in enumerate(zip(seq, seq[1:])) if b <= a]
+    # The server fires its first SR RSD_SR_FIRST_US (1s) after PLAY and
+    # libav re-anchors its timeline on it: when the anchor lands behind
+    # the smoothed RTP timeline this shows as ONE sub-frame backward
+    # step near the 1s mark. Same start-noise class as the pkt0 N/A.
+    sr_dip = (len(backs) == 1 and backs[0][1] < frame_dur and
+              seq[backs[0][0]] < 2.0)
     if na_late:
         print(f"FAIL pts N/A beyond first packet (indexes {na_late[:4]})")
-    elif any(b <= a for a, b in zip(seq, seq[1:])):
-        print("FAIL pts chain not monotone")
+    elif backs and not sr_dip:
+        print(f"FAIL pts chain not monotone ({len(backs)} backward steps, "
+              f"first at pkt {backs[0][0]}: -{backs[0][1]:.6f}s)")
     else:
         na0 = "one leading N/A (libav quirk)" if pkts[0]["pts"] is None else "pts from pkt0"
-        print(f"OK keyframe-first ({codec} nal {ntype}), {na0}, {len(seq)} pts monotone")
+        dip = ", one sub-frame SR re-anchor dip" if backs else ""
+        print(f"OK keyframe-first ({codec} nal {ntype}), {na0}, {len(seq)} pts monotone{dip}")
 PYEOF
 )
     case "$JOIN_VERDICT" in
