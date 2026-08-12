@@ -1987,7 +1987,7 @@ for line in sys.stdin:
                 cur["hex"].append(rest[:40].replace(" ", ""))
 
 if len(pkts) < 5:
-    print(f"FAIL only {len(pkts)} video packets in 1s probe")
+    print(f"FAIL only {len(pkts)} video packets in the probe window")
     sys.exit(0)
 
 head = "".join(pkts[0]["hex"])[:24]
