@@ -61,6 +61,7 @@ class RtspSession:
             self.sock = cx.wrap_socket(self.sock, server_hostname=host)
         self.cseq = 0
         self.session_id = None
+        self.preframes = []
         self.leftover = b""
         self.user = user
         self.password = password
@@ -90,6 +91,12 @@ class RtspSession:
         self.sock.sendall(msg.encode())
         buf = self.leftover
         self.leftover = b""
+        # Frames deframed while reading THIS response, in arrival order.
+        # A server may legitimately send binary frames between request
+        # and response (rsd emits RTCP BYE ahead of the TEARDOWN 200);
+        # discarding them silently blinded the BYE compliance leg for
+        # months. (ch, payload) tuples; reset on every request.
+        self.preframes = []
 
         # Read the response as an ordered stream: interleaved $-frames
         # can arrive before OR inside a short-written response, so
@@ -119,6 +126,7 @@ class RtspSession:
                     if not d:
                         return "", {}, ""
                     buf += d
+                self.preframes.append((buf[1], buf[4:4 + ln]))
                 buf = buf[4 + ln:]
                 continue
             # Consume text up to the next possible frame start; keep a

@@ -24,6 +24,7 @@ auth_pass = sys.argv[6] if len(sys.argv) > 6 else None
 url = f"rtsp://{host}:{port}{path}"
 results = []
 challenge = {}
+pre_response = b""
 
 
 def emit(okay, name, detail=""):
@@ -50,7 +51,7 @@ def _digest(method, u):
 
 
 def req(method, u, extra="", _retried=False):
-    global cseq
+    global cseq, pre_response
     cseq += 1
     auth_hdr = _digest(method, u) if auth_user and challenge else ""
     s.sendall(f"{method} {u} RTSP/1.0\r\nCSeq: {cseq}\r\nUser-Agent: raptor-test\r\n{auth_hdr}{extra}\r\n".encode())
@@ -66,6 +67,11 @@ def req(method, u, extra="", _retried=False):
         if not d:
             return "", "", b""
         buf += d
+    # Keep what arrived BEFORE the status line: a server may send
+    # frames between request and response (rsd emits RTCP BYE ahead of
+    # the TEARDOWN 200), and discarding this window blinded the BYE
+    # compliance leg for months. May begin mid-frame; scanners resync.
+    pre_response = buf[:buf.find(b"RTSP/1.0 ")]
     head, rest = buf[buf.find(b"RTSP/1.0 "):].split(b"\r\n\r\n", 1)
     clen = 0
     for line in head.split(b"\r\n"):
@@ -465,16 +471,37 @@ emit("200" in head.split("\r\n")[0], "RFC2326 TEARDOWN 200", head.split("\r\n")[
 
 # RFC 3550 6.6: a source that stops sending SHOULD send BYE, so a
 # receiver can drop the SSRC at once instead of waiting out its
-# timeout. Read whatever the server sends before it closes.
+# timeout. rsd sends one per track AHEAD of the TEARDOWN 200 (the
+# BYE must precede the response or it races the connection close),
+# so the bytes req() saw before the status line are the primary
+# evidence -- an after-the-response-only scan misses them, and this
+# leg skipped for months against a server that was sending BYE all
+# along. BYE may also ride inside a compound packet behind SR/SDES
+# (live555 style), so walk each frame's packet chain instead of
+# testing only the first packet type.
+
+
+def _frame_has_bye(_p):
+    _i = 0
+    while _i + 4 <= len(_p):
+        if _p[_i + 1] == 203:
+            return True
+        _step = (struct.unpack(">H", _p[_i + 2:_i + 4])[0] + 1) * 4
+        if _step <= 0:
+            break
+        _i += _step
+    return False
+
+
 _bye = False
-_scan = tail_rest
+_scan = pre_response + tail_rest
 _deadline = time.time() + 2.0
 try:
     s.settimeout(0.5)
     # Bounded by the clock, not by the peer: a server that keeps
     # sending after TEARDOWN would otherwise hold this loop open for
     # as long as it liked.
-    while time.time() < _deadline and len(_scan) < 1 << 20:
+    while not _bye and time.time() < _deadline and len(_scan) < 1 << 20:
         _d = s.recv(65536)
         if not _d:
             break
@@ -482,22 +509,17 @@ try:
 except (socket.timeout, OSError):
     pass
 _i = 0
-while _i + 4 <= len(_scan):
+while not _bye and _i + 4 <= len(_scan):
     if _scan[_i:_i + 1] != b"$":
         _i += 1
         continue
     _ln = struct.unpack(">H", _scan[_i + 2:_i + 4])[0]
-    _p = _scan[_i + 4:_i + 4 + _ln]
-    if len(_p) >= 4 and _p[1] == 203:
+    if _frame_has_bye(_scan[_i + 4:_i + 4 + _ln]):
         _bye = True
         break
     _i += 4 + _ln
-# RFC 3550 6.6 makes BYE a SHOULD, and neither backend sends one:
-# compy would need the feature and rsd-555 would need another live555
-# patch, which is not worth carrying for a SHOULD when RTSP TEARDOWN
-# has already told the receiver the session is over. Credited when a
-# server does send it, recorded as a known deviation when it does not,
-# rather than left as a permanently red check.
+# A SHOULD, not a MUST: credited when seen, recorded as a known
+# deviation when absent, rather than left as a permanently red check.
 if _bye:
     emit(True, "RFC3550 6.6 BYE sent on teardown", "BYE seen")
 else:
