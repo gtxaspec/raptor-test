@@ -104,6 +104,10 @@ section_for() {
 bringup() {
     local wait_port=$1
     shift
+    # Rings whose first frame gates readiness. A pass that tests a
+    # stream other than main (the h265 pass runs against ch1) must
+    # name that ring too, or its early legs race a silent encoder.
+    local rings=${BRINGUP_RINGS:-main}
     if ! want_backend "${BRINGUP_LABEL:-}"; then
         printf '%s\t%s\tskipped (--backend %s)\n' "$CURRENT_TARGET" \
             "${BRINGUP_LABEL:-?}" "$ONLY_BACKEND" >>"$MATRIX_FILE"
@@ -283,19 +287,21 @@ bringup() {
                 # soon as the producer maps it, but a consumer that
                 # connects before the first frame advertises a media-less
                 # SDP, and the suite fetches that SDP exactly once.
+                for ring in $rings; do
                 for i in \$(seq 60); do
-                    [ -e /dev/shm/rss_ring_main ] || { sleep 0.5; continue; }
+                    [ -e /dev/shm/rss_ring_\$ring ] || { sleep 0.5; continue; }
                     # ringdump reports on stderr, so 2>/dev/null threw
                     # away the very line being parsed: this gate has
                     # been waiting out its full timeout on every
                     # bring-up and proceeding on the ring file alone,
                     # which is exactly what it was written not to do.
-                    seq=\$('$DAEMON_BIN'/ringdump main 2>&1 |
+                    seq=\$('$DAEMON_BIN'/ringdump \$ring 2>&1 |
                         sed -n 's/.*Write seq: *\\([0-9]*\\).*/\\1/p')
                     [ -n \"\$seq\" ] && [ \"\$seq\" -gt 0 ] && break
                     sleep 0.5
                 done
-                if [ ! -e /dev/shm/rss_ring_main ]; then echo 'FAILED ring'; exit 1; fi ;;
+                if [ ! -e /dev/shm/rss_ring_\$ring ]; then echo \"FAILED ring \$ring\"; exit 1; fi
+                done ;;
             esac
         done
         # A consumer's pid exists before it binds: rings open first.
@@ -526,7 +532,7 @@ battery_for_target() {
         BRINGUP_LABEL="h265 (sub stream)"
         local saved_conf=$CONF_SET
         CONF_SET="$CONF_SET stream1.codec=h265"
-        if bringup "$RTSP_PORT" "${base_set[@]}" $DAEMONS_RTSP; then
+        if BRINGUP_RINGS="main sub" bringup "$RTSP_PORT" "${base_set[@]}" $DAEMONS_RTSP; then
             run_suite "h265 (sub stream)" "rtsp://$HOST:$RTSP_PORT/$PATH1" "${h265_args[@]}"
         fi
         CONF_SET=$saved_conf
