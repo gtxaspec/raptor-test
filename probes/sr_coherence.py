@@ -94,6 +94,21 @@ def main():
             dr = ((r2 - r1 + 2**31) % 2**32 - 2**31) / rate
             if dn > 0.5:
                 sr_ppms.append(round((dr / dn - 1.0) * 1e6, 1))
+        # Whole-window media-clock rate vs the device wall clock, from
+        # the first and last SR of the capture: the longest lever the
+        # window offers (adjacent pairs are ~5s and 1ms of mapping
+        # noise there is already 200ppm). Framing-independent and
+        # host-clock-independent, which the wire slope is not -- this
+        # is the drift number that stays measurable for codecs whose
+        # packet spacing rides an availability grid (AAC).
+        window_ppm = None
+        if len(srs[rtcp_ch]) >= 2:
+            _, n1, r1 = srs[rtcp_ch][0]
+            _, n2, r2 = srs[rtcp_ch][-1]
+            dn = n2 - n1
+            dr = ((r2 - r1 + 2**31) % 2**32 - 2**31) / rate
+            if dn > 5.0:
+                window_ppm = round((dr / dn - 1.0) * 1e6, 1)
         rel = [round((o - ntp_off[0]) * 1000, 3) for o in ntp_off]
         rel_arr = [round((o - arr_off[0]) * 1000, 3) for o in arr_off]
         steps = [round(b - a, 3) for a, b in zip(rel, rel[1:])]
@@ -111,6 +126,7 @@ def main():
             "steady_spread_ms": round(max(rel[2:]) - min(rel[2:]), 3) if len(rel) > 3 else None,
             "wire_ppm": wire_ppm,
             "sr_pair_ppm": sr_ppms,
+            "window_ppm": window_ppm,
         }
         base[name] = ntp_off
     # Cross-track: A/V alignment shift a muxing receiver sees per SR era.

@@ -1560,6 +1560,25 @@ for track, limit in (("video", 6.0), ("audio", 8.0)):
                     f"(excised {excised}ms)")
     else:
         msgs.append(f"{track} {raw}ms")
+# A/V relative media-clock rate over the whole window, from each
+# track's first-to-last SR pair. Both tracks anchor on the same
+# device wall clock, so their window_ppm difference is the rate the
+# tracks drift apart -- the number the audio-drift leg cannot
+# produce for chunk-grid codecs (AAC framing has no stable modal
+# step). A 40s window cannot see crystal-scale drift; the bound
+# targets the gross class (sample-rate math, resample and steering
+# defects, all hundreds-to-thousands of ppm) with 4x margin over
+# the ~120ppm noise floor of a 35s lever.
+vp = (d.get("video") or {}).get("window_ppm")
+ap = (d.get("audio") or {}).get("window_ppm")
+if vp is not None and ap is not None:
+    av = ap - vp
+    if abs(av) > 500:
+        msgs.append(f"a/v rate skew {av:+.0f}ppm over 500ppm limit "
+                    f"(video {vp:+.0f}, audio {ap:+.0f})")
+        bad = True
+    else:
+        msgs.append(f"a/v rate skew {av:+.0f}ppm")
 print(("FAIL " if bad else "OK ") + "; ".join(msgs))
 SRCOH_EOF
 )
