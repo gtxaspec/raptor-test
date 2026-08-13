@@ -1499,6 +1499,75 @@ while IFS= read -r line; do
     esac
 done <"$WORK/rfc.txt"
 
+
+# SR timeline coherence: successive sender reports must publish a
+# STABLE wall-to-RTP mapping. Every earlier SR check sampled one
+# instant (presence, cadence, one cross-track pair at +-200ms), and
+# this defect class lives in the era-to-era derivative: compy once
+# anchored each SR on the last packet's send instant, so AAC's
+# chunk-availability weave plus two steering-deadband sawtooths
+# walked the mapping +-10..46ms every report -- audible receiver
+# corrections invisible to instant-sampling and post-compensation
+# legs alike. Steady-state spread must stay in the low single digits
+# (first two reports carry one-time session anchoring); live555
+# measures in microseconds, compy-rsd within ~4ms on both tracks.
+if [ "$AUDIO_ONLY" != 1 ]; then
+    python3 "$PROBES/sr_coherence.py" "$HOST" "$PORT" "$RPATH" \
+        "${RTSP_USER:-}" "${RTSP_PASS:-}" 40 \
+        >"$WORK/srcoh.json" 2>"$WORK/srcoh.err" || true
+    SRCOH_VERDICT=$(python3 - "$WORK/srcoh.json" <<'SRCOH_EOF'
+import json
+import sys
+
+try:
+    d = json.loads(open(sys.argv[1]).read())
+except (OSError, ValueError) as e:
+    print(f"FAIL probe produced no result ({e})")
+    sys.exit(0)
+def steady_spread_excised(t):
+    """Spread of the steady mapping series, then with the single
+    largest step's two offsets removed. A real clock event (a rad
+    resync under load) is one honest excursion the RFC wants
+    reported; a defect is systematic, and survives excision: the
+    old pcmu ramp still spans 15ms with its snap removed."""
+    rel = t.get("mapping_rel_ms") or []
+    rel = rel[2:]
+    if len(rel) < 3:
+        return None, None
+    raw = max(rel) - min(rel)
+    steps = [abs(b - a) for a, b in zip(rel, rel[1:])]
+    k = steps.index(max(steps))
+    cut = [x for i, x in enumerate(rel) if i not in (k, k + 1)]
+    exc = (max(cut) - min(cut)) if len(cut) > 1 else 0.0
+    return round(raw, 3), round(exc, 3)
+
+msgs, bad = [], False
+for track, limit in (("video", 6.0), ("audio", 8.0)):
+    t = d.get(track) or {}
+    if track == "audio" and t.get("packets", 0) == 0:
+        msgs.append("no audio track")
+        continue
+    raw, excised = steady_spread_excised(t)
+    if t.get("srs", 0) < 4 or raw is None:
+        msgs.append(f"{track}: only {t.get('srs', 0)} SRs in the window")
+        bad = True
+    elif raw > limit and excised > limit:
+        msgs.append(f"{track} spread {raw}ms (excised {excised}ms) over "
+                    f"{limit}ms limit, corrections {t.get('corrections_ms')}")
+        bad = True
+    elif raw > limit:
+        msgs.append(f"{track} {raw}ms with one resync-class excursion "
+                    f"(excised {excised}ms)")
+    else:
+        msgs.append(f"{track} {raw}ms")
+print(("FAIL " if bad else "OK ") + "; ".join(msgs))
+SRCOH_EOF
+)
+    case "$SRCOH_VERDICT" in
+    OK*) ok "RFC3550 sender reports publish a stable timeline (${SRCOH_VERDICT#OK })" ;;
+    *) bad "RFC3550 sender reports publish a stable timeline" "${SRCOH_VERDICT#FAIL }" ;;
+    esac
+fi
 fi
 if want "fuzz"; then
 # ── 4e. RTSP parser fuzzing (--fuzz): malformed input, liveness-checked ──
