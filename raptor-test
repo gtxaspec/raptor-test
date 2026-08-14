@@ -2395,6 +2395,26 @@ else
     elif [ "$BCRING" = "no" ]; then
         bad "speaker ring on device" "missing mid-session (audio not landing)"
     fi
+    # Multi-codec offer: the probe bursts every payload type the
+    # m-line carries and skips the rest, so a PCMU-only server
+    # (rsd-555) produces no tokens here and asserts nothing.
+    BCOFFER=$(echo "$BCOUT" | grep -o 'BC_OFFER=.*' | cut -d= -f2)
+    [ -n "$BCOFFER" ] && ok "backchannel offer: RTP/AVP $BCOFFER"
+    for tok in PCMA L16 OPUS AAC; do
+        v=$(echo "$BCOUT" | grep -o "BC_SENT_$tok=[a-z0-9]*" | cut -d= -f2)
+        case "$v" in
+            "") ;; # payload type not offered
+            skip) skip "backchannel $tok (no AUs from local ffmpeg)" ;;
+            0) bad "backchannel $tok" "0 frames sent" ;;
+            *) ok "backchannel $tok accepted ($v frames)" ;;
+        esac
+    done
+    BCRR=$(echo "$BCOUT" | grep -o 'BC_RR=.*' | cut -d= -f2)
+    if [ "$BCRR" = "yes" ]; then
+        ok "backchannel receiver report seen on the RTCP channel"
+    elif [ -n "$BCRR" ]; then
+        skip "backchannel receiver report (none in 8s -- RFC 3550 SHOULD)"
+    fi
 fi
 
 fi

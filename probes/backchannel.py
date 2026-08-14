@@ -16,6 +16,7 @@ Usage: backchannel.py <host> <port> <path> [user] [pass]
 """
 import os
 import struct
+import subprocess
 import sys
 import time
 
@@ -77,6 +78,11 @@ def main():
     aud = next((x for x in sections
                 if x["m"].startswith("m=audio") and not x["sendonly"]), None)
     print(f"BC_CODEC={bc['rtpmap'] or 'unknown'}")
+    # Every payload type on the sendonly m-line: the client may pick
+    # any of them (RFC 8866), so the bursts below cover what is offered
+    # and silently skip what is not (rsd-555 offers PCMU alone).
+    offer = bc["m"].split("RTP/AVP", 1)[-1].split()
+    print(f"BC_OFFER={' '.join(offer)}")
 
     st, _, _ = s.request(
         "SETUP", absu(vid["ctl"]) if vid else s.url + "/video",
@@ -120,14 +126,77 @@ def main():
             pass
     print(f"BC_SENT={sent}", flush=True)
 
+    # The rest of the offer, one burst per payload type. Each frame
+    # drains the connection like the PCMU loop above.
+    def burst(pt, payloads, ts_step):
+        nonlocal seq
+        bts, n = 0, 0
+        for payload in payloads:
+            rtp = struct.pack("!BBHII", 0x80, pt, seq & 0xFFFF, bts,
+                              0x1234ABCD) + payload
+            frame = b"\x24" + struct.pack("!BH", 4, len(rtp)) + rtp
+            try:
+                s.sock.sendall(frame)
+                n += 1
+            except OSError:
+                break
+            seq += 1
+            bts += ts_step
+            for _pkt in s.packets(0.012):
+                pass
+        return n
+
+    if "8" in offer:
+        pcma = bytes([0xD5]) * 160
+        print(f"BC_SENT_PCMA={burst(8, [pcma] * 30, 160)}")
+    if "114" in offer:
+        l16 = struct.pack("!160h", *([1000] * 160))
+        print(f"BC_SENT_L16={burst(114, [l16] * 20, 160)}")
+    if "112" in offer:
+        # A 1-byte packet (TOC only) is a valid 20ms WB mono frame.
+        print(f"BC_SENT_OPUS={burst(112, [bytes([0x08])] * 30, 960)}")
+    if "113" in offer:
+        aus = []
+        try:
+            adts = subprocess.run(
+                ["ffmpeg", "-v", "quiet", "-f", "lavfi", "-i",
+                 "sine=frequency=440:duration=1", "-ar", "16000", "-ac",
+                 "1", "-c:a", "aac", "-b:a", "24k", "-f", "adts", "-"],
+                capture_output=True, timeout=20).stdout
+            i = 0
+            while i + 7 <= len(adts) and len(aus) < 12:
+                if adts[i] != 0xFF or (adts[i + 1] & 0xF0) != 0xF0:
+                    break
+                flen = (((adts[i + 3] & 0x03) << 11) | (adts[i + 4] << 3)
+                        | (adts[i + 5] >> 5))
+                hdr = 7 if (adts[i + 1] & 0x01) else 9
+                if (adts[i + 2] >> 2) & 0xF == 8 and flen > hdr:
+                    au = adts[i + hdr:i + flen]
+                    aus.append(b"\x00\x10"
+                               + struct.pack("!H", len(au) << 3) + au)
+                i += flen
+        except Exception:
+            aus = []
+        if aus:
+            print(f"BC_SENT_AAC={burst(113, aus, 1024)}")
+        else:
+            print("BC_SENT_AAC=skip")
+
     # Hold the session so the caller can verify device-side evidence
     # (rsd destroys the speaker ring at teardown by design). Long
     # enough for a loaded single-core unit to process the packets and
-    # for the caller to poll over ssh.
-    deadline = time.time() + 6.0
+    # for the caller to poll over ssh. While holding, watch the
+    # backchannel RTCP channel for the receiver report the server
+    # SHOULD send about our audio (RFC 3550).
+    rr_seen = False
+    deadline = time.time() + 8.0
     while time.time() < deadline:
-        for _pkt in s.packets(0.5):
-            pass
+        for _off, ch, payload in s.packets(0.5):
+            if ch == 5 and len(payload) >= 2 and payload[1] == 201:
+                rr_seen = True
+        if rr_seen and time.time() > deadline - 4.0:
+            break
+    print(f"BC_RR={'yes' if rr_seen else 'no'}")
 
     st, _, _ = s.request("GET_PARAMETER")
     print(f"BC_ALIVE={'yes' if '200' in st else code(st)}")
