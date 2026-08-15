@@ -108,6 +108,20 @@ Options:
                        daynight light transitions; on drift those legs
                        SKIP as a bench fact instead of failing as
                        camera bugs. Exit 1 on drift.
+  --lights-cast <cmd>  printf template with one %s (red|green|blue|
+                       amber|off) driving a colored ambient wash.
+                       Enables the colorcast checks: a cast must flip
+                       nothing (chroma is not darkness) and the AWB
+                       response per color is pinned in
+                       --colorcast-file and drift-checked after --
+                       the wash's own health check. Runs lit; cheap
+  --colorcast-file <f> pinned cast-response baseline (delete to re-pin)
+  --colorcast-only     run only the cast checks and exit (needs --ssh,
+                       --lights-set, --lights-cast; no rtsp URL)
+  --cast-key <level>   key-light duty during cast checks (default
+                       --lights-max). Lower amplifies the cast, but
+                       below the rig's AE-flat zone it stops being
+                       chroma-pure; re-pin the .colorcal on change
   --dusk-budget <s>    dusk transition budget (default 45) -- budgets
                        are rig-dependent, override when reproducing
   --dawn-budget <s>    dawn transition budget (default 90)
@@ -157,6 +171,7 @@ rtsp://*) URL=$1; shift ;;
 --daynight-only) ;;
 --light-cal) ;;
 --light-verify) ;;
+--colorcast-only) ;;
 *) echo "error: first argument must be an rtsp:// URL (got: $1)" >&2; exit 2 ;;
 esac
 SUB_URL=""
@@ -211,6 +226,14 @@ LIGHTS_MAX=4095
 LIGHT_CAL=0
 LIGHT_VERIFY=0
 LIGHT_CAL_FILE=""
+LIGHTS_CAST_CMD=""
+COLORCAST_FILE=""
+COLORCAST_ONLY=0
+# Key-light level during cast checks. Lower amplifies the wash's
+# share (measured 4x from full to 1/8 key on one rig) but below the
+# camera's AE-flat zone the cast stops being chroma-pure and starts
+# adding brightness -- pick per rig, inside the flat zone.
+CAST_KEY_LEVEL=""
 # Transition budgets are RIG-dependent (lamp brightness, sensor class,
 # probe cadence all move them); the defaults fit this bench, override
 # per target when reproducing elsewhere.
@@ -233,6 +256,10 @@ while [ $# -gt 0 ]; do
     --light-cal) LIGHT_CAL=1; shift ;;
     --light-verify) LIGHT_VERIFY=1; shift ;;
     --light-cal-file) LIGHT_CAL_FILE=$2; shift 2 ;;
+    --lights-cast) LIGHTS_CAST_CMD=$2; shift 2 ;;
+    --colorcast-file) COLORCAST_FILE=$2; shift 2 ;;
+    --colorcast-only) COLORCAST_ONLY=1; shift ;;
+    --cast-key) CAST_KEY_LEVEL=$2; shift 2 ;;
     --dusk-budget) DUSK_BUDGET=$2; shift 2 ;;
     --dawn-budget) DAWN_BUDGET=$2; shift 2 ;;
     --duration) DUR=$2; shift 2 ;;
@@ -423,15 +450,7 @@ echo "$n $flaps $ledoff"'
         # flapping under a monotonic dim is precisely what the
         # hysteresis/debounce machinery exists to prevent, and a step
         # change can never test it.
-        DN_FLAPWATCH='
-secs=$1; t0=$(date +%s); prev=""; trans=0
-while [ $(( $(date +%s)-t0 )) -lt "$secs" ]; do
-    st=$(raptorctl ric status 2>/dev/null | sed -n "s/.*\"state\":\"\([a-z]*\)\".*/\1/p")
-    [ -n "$st" ] && [ -n "$prev" ] && [ "$st" != "$prev" ] && trans=$((trans+1))
-    [ -n "$st" ] && prev=$st
-    sleep 2
-done
-echo "$trans"'
+        # DN_FLAPWATCH is shared scope (beside LC_READ).
         # Log-spaced levels: camera AE is logarithmic, so equal-RATIO
         # steps are equal exposure steps. A linear duty ramp sprints
         # through the dark end where the night threshold actually
@@ -946,16 +965,27 @@ while :; do
     l=$(printf %s "$e" | sed -n "s/.*\"ae_luma\":\([0-9]*\).*/\1/p")
     u=$(printf %s "$e" | sed -n "s/.*\"exposure_us\":\([0-9]*\).*/\1/p")
     v=$(printf %s "$e" | sed -n "s/.*\"ev\":\([0-9]*\).*/\1/p")
+    wr=$(printf %s "$e" | sed -n "s/.*\"wb_rgain\":\([0-9]*\).*/\1/p")
+    wb=$(printf %s "$e" | sed -n "s/.*\"wb_bgain\":\([0-9]*\).*/\1/p")
     if [ -n "$g" ] && [ -n "$pg" ]; then
         dg=$((g - pg)); [ "$dg" -lt 0 ] && dg=$((-dg))
         dl=$((l - pl)); [ "$dl" -lt 0 ] && dl=$((-dl))
         tg=$((pg / 10 + 2)); tl=$((pl / 10 + 2))
-        [ "$dg" -le "$tg" ] && [ "$dl" -le "$tl" ] && { echo "${g:-?} ${l:-?} ${u:-?} ${v:-?}"; exit 0; }
+        [ "$dg" -le "$tg" ] && [ "$dl" -le "$tl" ] && { echo "${g:-?} ${l:-?} ${u:-?} ${v:-?} ${wr:-?} ${wb:-?}"; exit 0; }
     fi
     pg=$g; pl=$l
-    [ $(( $(date +%s)-t0 )) -ge 8 ] && { echo "${g:-?} ${l:-?} ${u:-?} ${v:-?}"; exit 0; }
+    [ $(( $(date +%s)-t0 )) -ge 8 ] && { echo "${g:-?} ${l:-?} ${u:-?} ${v:-?} ${wr:-?} ${wb:-?}"; exit 0; }
     sleep 1
 done'
+DN_FLAPWATCH='
+secs=$1; t0=$(date +%s); prev=""; trans=0
+while [ $(( $(date +%s)-t0 )) -lt "$secs" ]; do
+    st=$(raptorctl ric status 2>/dev/null | sed -n "s/.*\"state\":\"\([a-z]*\)\".*/\1/p")
+    [ -n "$st" ] && [ -n "$prev" ] && [ "$st" != "$prev" ] && trans=$((trans+1))
+    [ -n "$st" ] && prev=$st
+    sleep 2
+done
+echo "$trans"'
 lc_read() { printf '%s\n' "$LC_READ" | LC_SSH sh -s; }
 # Append-only instrument history beside the table: even with a pinned
 # baseline, slow creep is easiest to see as a trend across entries.
@@ -1023,6 +1053,112 @@ light_verify_run() {
     lc_hist "verify VERDICT=ok"
     echo "${detail# }"
     return 0
+}
+
+# Colored-ambient assertions from the rear RGB wash. Two properties,
+# both born from measurement: under the key light a cast shifts AWB
+# gains with ZERO brightness signature (gain/EV bit-identical), so
+# (1) no trigger may flip day/night on chroma alone -- the stealth
+# condition colored streetlights create -- and (2) the cast response
+# itself (sign + magnitude per color) is the wash's health check,
+# pinned in a .colorcal on first run and drift-checked after
+# (re-pin deliberately by deleting the file). Runs in a LIT room:
+# no transitions, cheap.
+colorcast_leg() {
+    if [ -z "$SSH_TARGET" ] || [ -z "$LIGHTS_SET_CMD" ] || [ -z "$LIGHTS_CAST_CMD" ]; then
+        skip "colorcast (needs --ssh, --lights-set and --lights-cast)"
+        return
+    fi
+    [ -n "$BENCH_QUIESCE_CMD" ] && eval "$BENCH_QUIESCE_CMD" > /dev/null 2>&1
+    local key=${CAST_KEY_LEVEL:-$LIGHTS_MAX}
+    # shellcheck disable=SC2059
+    eval "$(printf "$LIGHTS_SET_CMD" "$key")" > /dev/null 2>&1
+    # shellcheck disable=SC2059
+    eval "$(printf "$LIGHTS_CAST_CMD" off)" > /dev/null 2>&1
+    sleep 4
+    lc_read > /dev/null
+    set -- $(lc_read)
+    local n_r=${5:-?} n_b=${6:-?}
+    if [ "$n_r" = "?" ] || [ "$n_b" = "?" ]; then
+        skip "colorcast (platform reports no AWB gains)"
+        return
+    fi
+    ok "colorcast: neutral reference under the key light (rgain $n_r bgain $n_b)"
+    local color dr db cr cb trans
+    local rec=""
+    for color in red blue; do
+        # shellcheck disable=SC2059
+        eval "$(printf "$LIGHTS_CAST_CMD" "$color")" > /dev/null 2>&1
+        # Immunity first, while the cast holds: a pure chroma change
+        # must never flip day/night on any trigger.
+        trans=$(printf '%s\n' "$DN_FLAPWATCH" | LC_SSH sh -s -- 12)
+        if [ "${trans:-1}" = "0" ]; then
+            ok "colorcast: $color cast flips nothing (12s, 0 transitions)"
+        else
+            bad "colorcast: $color cast flips nothing" \
+                "${trans:-?} day/night transitions under a pure chroma change"
+        fi
+        lc_read > /dev/null
+        set -- $(lc_read)
+        cr=${5:-0}; cb=${6:-0}
+        dr=$((cr - n_r)); db=$((cb - n_b))
+        rec="$rec $color:$dr:$db"
+        # The RESPONSE DIRECTION is per-rig truth, not physics: a
+        # modern AWB follows the light's color (V3 blue: bgain +12)
+        # while the T20's correlation-based AWB INVERTS it (V2 blue:
+        # bgain -29, "blue scene = shade, warm it up") and barely
+        # sees red bounce at all. So direction and magnitude are
+        # recorded and pinned, never asserted universally -- the
+        # drift check against this rig's own pinned response is the
+        # enforcement, and it carries the direction implicitly.
+        local adr=$dr adb=$db
+        [ "$adr" -lt 0 ] && adr=$((-adr))
+        [ "$adb" -lt 0 ] && adb=$((-adb))
+        if [ "$adr" -ge 4 ] || [ "$adb" -ge 4 ]; then
+            ok "colorcast: $color cast measurably shifts AWB (dr=$dr db=$db)"
+        else
+            ok "colorcast: $color cast response recorded (dr=$dr db=$db, below wash authority on this rig)"
+        fi
+    done
+    # shellcheck disable=SC2059
+    eval "$(printf "$LIGHTS_CAST_CMD" off)" > /dev/null 2>&1
+    if [ -n "$COLORCAST_FILE" ]; then
+        if [ ! -f "$COLORCAST_FILE" ]; then
+            {
+                echo "# colorcast $(date -u +%Y-%m-%dT%H:%M:%SZ) target=$SSH_TARGET"
+                echo "neutral $n_r $n_b"
+                for pair in $rec; do
+                    echo "${pair%%:*} ${pair#*:}" | tr ':' ' '
+                done
+            } > "$COLORCAST_FILE"
+            ok "colorcast: response pinned to $(basename "$COLORCAST_FILE")"
+        else
+            local fail=""
+            for pair in $rec; do
+                color=${pair%%:*}
+                dr=$(echo "$pair" | cut -d: -f2)
+                db=$(echo "$pair" | cut -d: -f3)
+                set -- $(/usr/bin/grep "^$color " "$COLORCAST_FILE")
+                local sr=${2:-0} sb=${3:-0} d
+                for d in "$dr:$sr" "$db:$sb"; do
+                    local now=${d%%:*} was=${d#*:} diff tol
+                    diff=$((now - was)); [ "$diff" -lt 0 ] && diff=$((-diff))
+                    tol=$((was < 0 ? -was : was)); tol=$((tol / 2)); [ "$tol" -lt 5 ] && tol=5
+                    [ "$diff" -le "$tol" ] || fail="$fail $color(now $now was $was)"
+                done
+            done
+            if [ -z "$fail" ]; then
+                ok "colorcast: wash response matches $(basename "$COLORCAST_FILE")"
+            else
+                bad "colorcast: wash response matches pinned baseline" \
+                    "drift:$fail -- moved/aged wash? re-pin by deleting the file"
+            fi
+            printf '%s recheck neutral=%s/%s%s\n' \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$n_r" "$n_b" "$rec" \
+                >> "$COLORCAST_FILE.history"
+        fi
+    fi
+    [ -n "$BENCH_RESTORE_CMD" ] && eval "$BENCH_RESTORE_CMD" > /dev/null 2>&1
 }
 
 light_cal() {
@@ -1121,6 +1257,13 @@ if [ "${LIGHT_VERIFY:-0}" = 1 ]; then
     fi
     [ -n "$BENCH_RESTORE_CMD" ] && eval "$BENCH_RESTORE_CMD" > /dev/null 2>&1
     exit "$RC"
+fi
+
+if [ "${COLORCAST_ONLY:-0}" = 1 ]; then
+    echo "=== Colored-ambient cast checks (solo) ==="
+    echo "    suite: $(git -C "${RAPTOR_TEST_HOME:-.}" describe --always --dirty 2>/dev/null || echo unknown)"
+    colorcast_leg
+    print_result
 fi
 
 if [ "${DAYNIGHT_ONLY:-0}" = 1 ]; then
@@ -2454,6 +2597,14 @@ if want "daynight"; then
 # gain pinned at the dark ceiling). Bench-only: needs room lighting
 # the suite can switch.
 [ "$DAYNIGHT" = 1 ] && daynight_cycle
+
+# ── 7d. Colored-ambient cast checks (--lights-cast) ──
+# Chroma is not darkness: the wash shifts AWB gains with zero
+# brightness signature, and nothing may flip day/night on it. The
+# per-color response doubles as the wash's own drift check.
+if [ -n "$LIGHTS_CAST_CMD" ] && want "colorcast"; then
+    colorcast_leg
+fi
 
 fi
 if want "mpv"; then

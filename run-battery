@@ -409,6 +409,7 @@ battery_for_target() {
     GO2RTC=''; MEDIAMTX=''; FRIGATE=no; RECORD_CHECK=''; NOTES=''; GOP=''
     # Lights/bench commands must not leak between targets under --all
     LIGHTS_ON_CMD=''; LIGHTS_OFF_CMD=''; LIGHTS_SET_CMD=''; LIGHTS_RAMP_SECS=''; LIGHT_CAL_FILE=''
+    LIGHTS_CAST_CMD=''; COLORCAST_FILE=''; CAST_KEY_LEVEL=''
     BENCH_QUIESCE_CMD=''; BENCH_RESTORE_CMD=''
     TLS=''; RTMP=''; WEBRTC=''
     # Daemon profiles (opt-in; empty DAEMONS_BASE = manage nothing)
@@ -490,6 +491,12 @@ battery_for_target() {
         [ -n "${LIGHT_CAL_FILE:-}" ] && rsd_args+=(--light-cal-file "$LIGHT_CAL_FILE")
         [ -n "${BENCH_QUIESCE_CMD:-}" ] && rsd_args+=(--bench-quiesce "$BENCH_QUIESCE_CMD")
         [ -n "${BENCH_RESTORE_CMD:-}" ] && rsd_args+=(--bench-restore "$BENCH_RESTORE_CMD")
+    fi
+    # Colored-ambient cast checks ride any pass with ssh + a wash.
+    if [ -n "${LIGHTS_CAST_CMD:-}" ] && [ -n "$SSH" ]; then
+        rsd_args+=(--lights-cast "$LIGHTS_CAST_CMD")
+        [ -n "${COLORCAST_FILE:-}" ] && rsd_args+=(--colorcast-file "$COLORCAST_FILE")
+        [ -n "${CAST_KEY_LEVEL:-}" ] && rsd_args+=(--cast-key "$CAST_KEY_LEVEL")
     fi
     [ -n "$TLS" ]  && rsd_args+=(--tls "$TLS")
     [ -n "$RTMP" ] && rsd_args+=(--rtmp "$RTMP")
