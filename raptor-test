@@ -2415,6 +2415,12 @@ else
     elif [ -n "$BCRR" ]; then
         skip "backchannel receiver report (none in 8s -- RFC 3550 SHOULD)"
     fi
+    BCBYE=$(echo "$BCOUT" | grep -o 'BC_BYE=.*' | cut -d= -f2)
+    if [ "$BCBYE" = "yes" ]; then
+        ok "backchannel leave BYE ahead of the TEARDOWN 200"
+    elif [ -n "$BCBYE" ]; then
+        skip "backchannel leave BYE (none seen -- RFC 3550 SHOULD)"
+    fi
 fi
 
 fi

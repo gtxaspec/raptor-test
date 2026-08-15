@@ -200,7 +200,21 @@ def main():
 
     st, _, _ = s.request("GET_PARAMETER")
     print(f"BC_ALIVE={'yes' if '200' in st else code(st)}")
+
+    # The leave compound rides ahead of the TEARDOWN 200 on the
+    # backchannel RTCP channel; rtsplib keeps frames racing a
+    # response in preframes exactly for checks like this.
     s.request("TEARDOWN")
+    bye = False
+    for ch, payload in getattr(s, "preframes", []):
+        if ch != 5:
+            continue
+        off = 0
+        while off + 4 <= len(payload):
+            if payload[off + 1] == 203:
+                bye = True
+            off += (((payload[off + 2] << 8) | payload[off + 3]) + 1) * 4
+    print(f"BC_BYE={'yes' if bye else 'no'}")
     s.close()
 
 
