@@ -63,14 +63,15 @@ Options:
                        room lighting only)
   --daynight-only      run ONLY the day/night cycle and exit; no rtsp
                        URL needed (daemons must already be running)
-  --only <regex>       run only suite sections whose key matches. Keys:
-                       signaling auth transports wire sessions avts drift
-                       content rfc restream concurrency regression kill
-                       health mpv join ortsp slow backchannel mjpeg
-                       (+ flag-gated: soak fuzz daynight rhd srt tls rtmp
-                       webrtc frigate reccheck). Some legs derive context
-                       (e.g. codec) from earlier sections and fall back
-                       to defaults when those are skipped.
+  --only <regex>       run only suite sections whose key matches;
+                       --sections lists the keys. Some legs derive
+                       context (e.g. codec) from earlier sections and
+                       fall back to defaults when those are skipped;
+                       flag-gated sections still need their flags.
+  --sections           list the --only section keys and exit. Derived
+                       from this script's own gates, so it cannot
+                       drift from the code (the old hand-written list
+                       documented a key that gated nothing).
   --lights-on <cmd>    shell command that turns the room lights on
   --lights-off <cmd>   shell command that turns the room lights off
   --bench-quiesce <c>  run before the daynight cycle: neutralize OTHER
@@ -102,6 +103,14 @@ EOF
 }
 case "${1:-}" in
 -h|--help) usage; exit 0 ;;
+--sections)
+    # Derived from the executing copy (the private-copy re-exec
+    # guarantees this is the code actually running), so the list
+    # cannot drift from the gates the way a hand-written one did.
+    echo "Section keys for --only (regex over these):"
+    /usr/bin/grep -oE 'want "[a-z0-9_-]+"' "$RAPTOR_TEST_SELF" \
+        | sed 's/^want "//; s/"$//' | sort -u | sed 's/^/  /'
+    exit 0 ;;
 esac
 [ $# -ge 1 ] || { echo "usage: raptor-test <rtsp-url> [options]   (--help for the full list)" >&2; exit 2; }
 # --daynight-only needs no stream: allow invocation without a URL.
@@ -1603,6 +1612,10 @@ restream_legs() {
 # ── Local restreamers: pinned single-binary consumers spawned for
 #    this run, so the battery carries its own interop targets instead
 #    of depending on a helper host. ──
+# Gated here so BOTH call sites honor --only: without this, a target
+# conf that declares GO2RTC/MEDIAMTX ran the restream legs under any
+# --only subset (the documented "restream" key gated nothing).
+want "restream" || return 0
 GO2RTC_VER=1.9.14
 MEDIAMTX_VER=1.19.3
 RESTREAMER_PIDS=""
