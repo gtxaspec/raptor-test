@@ -16,3 +16,4 @@ auto.key
 tools/go2rtc
 tools/mediamtx
 battery-logs/
+targets/*.lightcal

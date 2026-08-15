@@ -74,15 +74,29 @@ Options:
                        documented a key that gated nothing).
   --lights-on <cmd>    shell command that turns the room lights on
   --lights-off <cmd>   shell command that turns the room lights off
-  --lights-set <cmd>   printf template with exactly one %d (percent
-                       0-100) that sets the room light level. Enables
-                       RAMPED dusk/dawn in the daynight cycle: the
-                       first dusk and the dawn walk a log-spaced ramp
-                       (equal-ratio steps = equal exposure steps to a
-                       logarithmic AE) while the camera's state is
-                       watched for flapping; the second dusk stays a
-                       step so both stimulus classes run every cycle
+  --lights-set <cmd>   printf template with exactly one %d (RAW duty
+                       level, 0..--lights-max) that sets the room
+                       light. Raw counts, not percent: the dark end
+                       where night thresholds live spans the last few
+                       percent, and 1% is already 41 counts on a
+                       12-bit chip. Enables RAMPED dusk/dawn in the
+                       daynight cycle: the first dusk and the dawn
+                       walk a log-spaced ramp (equal-ratio steps =
+                       equal exposure steps to a logarithmic AE)
+                       while the camera's state is watched for
+                       flapping; the second dusk stays a step so both
+                       stimulus classes run every cycle
   --lights-ramp <s>    ramp duration in seconds (default 24)
+  --lights-max <n>     full-scale duty for --lights-set (default 4095)
+  --light-cal          calibrate the light source against the camera:
+                       force day, walk a half-EV level ladder from
+                       full to dark, record settled AE readings
+                       (luma/gain/exposure/ev) per rung, report the
+                       rungs where the camera's own thresholds cross,
+                       and diff against the previous calibration to
+                       catch bench drift. Needs --ssh + --lights-set;
+                       no rtsp URL. Restores auto + full brightness.
+  --light-cal-file <f> store/compare the calibration table here
   --bench-quiesce <c>  run before the daynight cycle: neutralize OTHER
                        bench cameras (their auto-night IR floods the
                        room and fakes a lit scene). --bench-restore
@@ -127,6 +141,7 @@ URL=""
 case "$1" in
 rtsp://*) URL=$1; shift ;;
 --daynight-only) ;;
+--light-cal) ;;
 *) echo "error: first argument must be an rtsp:// URL (got: $1)" >&2; exit 2 ;;
 esac
 SUB_URL=""
@@ -177,6 +192,9 @@ LIGHTS_ON_CMD=""
 LIGHTS_OFF_CMD=""
 LIGHTS_SET_CMD=""
 LIGHTS_RAMP_SECS=24
+LIGHTS_MAX=4095
+LIGHT_CAL=0
+LIGHT_CAL_FILE=""
 while [ $# -gt 0 ]; do
     case "$1" in
     --sub) SUB_URL=$2; shift 2 ;;
@@ -190,6 +208,9 @@ while [ $# -gt 0 ]; do
     --lights-off) LIGHTS_OFF_CMD=$2; shift 2 ;;
     --lights-set) LIGHTS_SET_CMD=$2; shift 2 ;;
     --lights-ramp) LIGHTS_RAMP_SECS=$2; shift 2 ;;
+    --lights-max) LIGHTS_MAX=$2; shift 2 ;;
+    --light-cal) LIGHT_CAL=1; shift ;;
+    --light-cal-file) LIGHT_CAL_FILE=$2; shift 2 ;;
     --duration) DUR=$2; shift 2 ;;
     --go2rtc) GO2RTC=$2; shift 2 ;;
     --mediamtx) MEDIAMTX=$2; shift 2 ;;
@@ -391,10 +412,41 @@ echo "$trans"'
         # steps are equal exposure steps. A linear duty ramp sprints
         # through the dark end where the night threshold actually
         # lives and dawdles at the bright end where nothing happens.
-        DN_RAMP_LEVELS="100 64 40 25 16 10 6 4 2 1 0"
+        # Uncalibrated fallback: fractions of --lights-max, ~equal
+        # RATIO. But duty is not light: real strips have flat spans
+        # and cliff spans, so when a calibration table exists
+        # (--light-cal-file, written by --light-cal) the rungs are
+        # picked from it at equal MEASURED-luma spacing instead --
+        # every step then moves the camera by the same amount no
+        # matter how crooked the duty curve is.
+        DN_RAMP_FRACS="1000 640 400 250 160 100 60 40 20 10 0"
+        dn_ramp_levels() { # emit bright->dark level list, one per line
+            if [ -n "$LIGHT_CAL_FILE" ] && [ -f "$LIGHT_CAL_FILE" ]; then
+                awk 'BEGIN { n = 0 }  # uninit n subscripts as "" not 0
+                    $1 ~ /^[0-9]/ && $2 ~ /^[0-9]/ { lv[n]=$1; lm[n]=$2; n++ }
+                    END {
+                        if (n < 4) exit 1
+                        hi = lm[0]; lo = lm[n-1]; steps = 10
+                        print lv[0]; last = lv[0]
+                        for (s = 1; s < steps; s++) {
+                            t = hi - (hi-lo)*s/steps
+                            best = 0; bd = 1e9
+                            for (i = 0; i < n; i++) {
+                                d = lm[i]-t; if (d < 0) d = -d
+                                if (d < bd) { bd = d; best = i }
+                            }
+                            if (lv[best] != last) { print lv[best]; last = lv[best] }
+                        }
+                        if (last + 0 != 0) print 0
+                    }' "$LIGHT_CAL_FILE" && return 0
+            fi
+            local f
+            for f in $DN_RAMP_FRACS; do echo $((LIGHTS_MAX * f / 1000)); done
+        }
         dn_ramp() { # down|up: walk LIGHTS_SET_CMD over the schedule
-            local levels="$DN_RAMP_LEVELS" l pause n
-            [ "$1" = up ] && levels=$(printf '%s\n' $DN_RAMP_LEVELS | tac | tr '\n' ' ')
+            local levels l pause n
+            levels=$(dn_ramp_levels | tr '\n' ' ')
+            [ "$1" = up ] && levels=$(printf '%s\n' $levels | tac | tr '\n' ' ')
             n=$(echo "$levels" | wc -w)
             pause=$(awk -v d="$LIGHTS_RAMP_SECS" -v n="$n" 'BEGIN{printf "%.2f", d/n}')
             for l in $levels; do
@@ -840,6 +892,110 @@ bad() {
 # For quick IR/ircut iteration on the bench:
 #   raptor-test --daynight-only --ssh root@cam \
 #       --lights-on '<cmd>' --lights-off '<cmd>'
+light_cal() {
+    # Calibrate the light source against THIS camera: duty is not
+    # light output, and light is not camera signal -- the mapping is
+    # per-rig physics (strip aging, geometry, reflectance) and this
+    # table is its measurement. Forced day keeps the filter and IR
+    # parked so every rung reads pure AE response. The dark rungs are
+    # where the value is: LED forward-voltage cutoff makes the bottom
+    # of the range nonlinear exactly where night thresholds live,
+    # which is why the ladder is raw counts, not percent.
+    if [ -z "$SSH_TARGET" ] || [ -z "$LIGHTS_SET_CMD" ]; then
+        echo "light-cal needs --ssh and --lights-set" >&2
+        exit 2
+    fi
+    LC_SSH() { ssh -o ConnectTimeout=8 "$SSH_TARGET" "$@"; }
+    # Remote: poll until two successive readings agree within 10%
+    # (gain AND luma), cap 8s; print the settled line either way.
+    LC_READ='
+pg=""; pl=""; t0=$(date +%s)
+while :; do
+    e=$(raptorctl rvd get-exposure 2>/dev/null)
+    g=$(printf %s "$e" | sed -n "s/.*\"total_gain\":\([0-9]*\).*/\1/p")
+    l=$(printf %s "$e" | sed -n "s/.*\"ae_luma\":\([0-9]*\).*/\1/p")
+    u=$(printf %s "$e" | sed -n "s/.*\"exposure_us\":\([0-9]*\).*/\1/p")
+    v=$(printf %s "$e" | sed -n "s/.*\"ev\":\([0-9]*\).*/\1/p")
+    if [ -n "$g" ] && [ -n "$pg" ]; then
+        dg=$((g - pg)); [ "$dg" -lt 0 ] && dg=$((-dg))
+        dl=$((l - pl)); [ "$dl" -lt 0 ] && dl=$((-dl))
+        tg=$((pg / 10 + 2)); tl=$((pl / 10 + 2))
+        [ "$dg" -le "$tg" ] && [ "$dl" -le "$tl" ] && { echo "${g:-?} ${l:-?} ${u:-?} ${v:-?}"; exit 0; }
+    fi
+    pg=$g; pl=$l
+    [ $(( $(date +%s)-t0 )) -ge 8 ] && { echo "${g:-?} ${l:-?} ${u:-?} ${v:-?}"; exit 0; }
+    sleep 1
+done'
+    echo "=== Light-source calibration ($SSH_TARGET, max $LIGHTS_MAX) ==="
+    # Same interference rule as the daynight cycle: another bench
+    # camera in auto goes night at the dark rungs and its IR floods
+    # the table with light that is not the strip's.
+    [ -n "$BENCH_QUIESCE_CMD" ] && eval "$BENCH_QUIESCE_CMD" > /dev/null 2>&1
+    TH=$(LC_SSH "raptorctl ric get-thresholds" </dev/null 2>/dev/null)
+    NL=$(printf %s "$TH" | sed -n 's/.*"night_luma":\([0-9]*\).*/\1/p')
+    NG=$(printf %s "$TH" | sed -n 's/.*"night_gain":\([0-9]*\).*/\1/p')
+    echo "  thresholds: night_luma=${NL:-?} night_gain=${NG:-?}"
+    PREV_MODE=$(LC_SSH "raptorctl ric status" </dev/null 2>/dev/null |
+        sed -n 's/.*"mode":"\([a-z]*\)".*/\1/p')
+    LC_SSH "raptorctl ric mode day" </dev/null > /dev/null 2>&1
+    sleep 3
+    # Half-EV ladder: each rung ~1/sqrt(2) of the last, in permille of
+    # full scale, plus a dense integer tail through the cutoff region.
+    LADDER_PM="1000 707 500 354 250 177 125 88 62 44 31 22 16 11 8 5 4 3 2 1"
+    NEW=$(mktemp)
+    {
+        echo "# light-cal $(date -u +%Y-%m-%dT%H:%M:%SZ) target=$SSH_TARGET max=$LIGHTS_MAX night_luma=${NL:-?} night_gain=${NG:-?}"
+        echo "# level luma gain exposure_us ev"
+    } > "$NEW"
+    LUMA_CROSS=""; GAIN_CROSS=""
+    for pm in $LADDER_PM 0; do
+        LVL=$((LIGHTS_MAX * pm / 1000))
+        [ "$pm" != 0 ] && [ "$LVL" -lt 1 ] && LVL=1
+        # shellcheck disable=SC2059
+        eval "$(printf "$LIGHTS_SET_CMD" "$LVL")" > /dev/null 2>&1
+        R=$(printf '%s\n' "$LC_READ" | LC_SSH sh -s)
+        set -- $R
+        printf '%6d %5s %8s %9s %9s\n' "$LVL" "${2:-?}" "${1:-?}" "${3:-?}" "${4:-?}" | tee -a "$NEW"
+        if [ -z "$LUMA_CROSS" ] && [ -n "$NL" ] && [ "${2:-999}" != "?" ] &&
+           [ "${2:-999}" -lt "$NL" ] 2>/dev/null; then LUMA_CROSS=$LVL; fi
+        if [ -z "$GAIN_CROSS" ] && [ -n "$NG" ] && [ "${1:-0}" != "?" ] &&
+           [ "${1:-0}" -gt "$NG" ] 2>/dev/null; then GAIN_CROSS=$LVL; fi
+    done
+    echo "# crossings: night_luma@level=${LUMA_CROSS:-none} night_gain@level=${GAIN_CROSS:-none}" | tee -a "$NEW"
+    if [ -n "$LIGHT_CAL_FILE" ]; then
+        if [ -f "$LIGHT_CAL_FILE" ]; then
+            # Bench-drift check: same rung, previous run vs now. A big
+            # luma shift at a mid rung means the RIG changed (aging,
+            # geometry) -- recalibrate trust before blaming the camera.
+            DRIFT=$(awk 'NR==FNR { if ($1 ~ /^[0-9]/) old[$1]=$2; next }
+                $1 ~ /^[0-9]/ && ($1 in old) && old[$1]+0 > 4 {
+                    d = $2 - old[$1]; if (d < 0) d = -d
+                    if (d * 100 > old[$1] * 25 && d > 5)
+                        printf "  level %s: luma %s -> %s\n", $1, old[$1], $2
+                }' "$LIGHT_CAL_FILE" "$NEW")
+            if [ -n "$DRIFT" ]; then
+                echo "DRIFT vs $(basename "$LIGHT_CAL_FILE") (>25% luma shift):"
+                echo "$DRIFT"
+            else
+                echo "no drift vs $(basename "$LIGHT_CAL_FILE")"
+            fi
+        fi
+        mv "$NEW" "$LIGHT_CAL_FILE"
+        echo "calibration stored: $LIGHT_CAL_FILE"
+    else
+        rm -f "$NEW"
+    fi
+    LC_SSH "raptorctl ric mode ${PREV_MODE:-auto}" </dev/null > /dev/null 2>&1
+    [ -n "$BENCH_RESTORE_CMD" ] && eval "$BENCH_RESTORE_CMD" > /dev/null 2>&1
+    # shellcheck disable=SC2059
+    eval "$(printf "$LIGHTS_SET_CMD" "$LIGHTS_MAX")" > /dev/null 2>&1
+    exit 0
+}
+
+if [ "${LIGHT_CAL:-0}" = 1 ]; then
+    light_cal
+fi
+
 if [ "${DAYNIGHT_ONLY:-0}" = 1 ]; then
     echo "=== Day/night hardware cycle (solo) ==="
     daynight_cycle

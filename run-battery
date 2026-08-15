@@ -389,7 +389,7 @@ battery_for_target() {
     R555_PORT=''; R555_PATH0=stream0; R555_PATH1=stream1
     GO2RTC=''; MEDIAMTX=''; FRIGATE=no; RECORD_CHECK=''; NOTES=''; GOP=''
     # Lights/bench commands must not leak between targets under --all
-    LIGHTS_ON_CMD=''; LIGHTS_OFF_CMD=''; LIGHTS_SET_CMD=''; LIGHTS_RAMP_SECS=''
+    LIGHTS_ON_CMD=''; LIGHTS_OFF_CMD=''; LIGHTS_SET_CMD=''; LIGHTS_RAMP_SECS=''; LIGHT_CAL_FILE=''
     BENCH_QUIESCE_CMD=''; BENCH_RESTORE_CMD=''
     TLS=''; RTMP=''; WEBRTC=''
     # Daemon profiles (opt-in; empty DAEMONS_BASE = manage nothing)
@@ -466,6 +466,7 @@ battery_for_target() {
         rsd_args+=(--daynight --lights-on "$LIGHTS_ON_CMD" --lights-off "$LIGHTS_OFF_CMD")
         [ -n "${LIGHTS_SET_CMD:-}" ] && rsd_args+=(--lights-set "$LIGHTS_SET_CMD")
         [ -n "${LIGHTS_RAMP_SECS:-}" ] && rsd_args+=(--lights-ramp "$LIGHTS_RAMP_SECS")
+        [ -n "${LIGHT_CAL_FILE:-}" ] && rsd_args+=(--light-cal-file "$LIGHT_CAL_FILE")
         [ -n "${BENCH_QUIESCE_CMD:-}" ] && rsd_args+=(--bench-quiesce "$BENCH_QUIESCE_CMD")
         [ -n "${BENCH_RESTORE_CMD:-}" ] && rsd_args+=(--bench-restore "$BENCH_RESTORE_CMD")
     fi
