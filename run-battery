@@ -66,6 +66,11 @@ mkdir -p "$DIR/battery-logs"
 BATTERY_LOG="$DIR/battery-logs/$(echo "$1" | tr -d '-' | tr '/' '_')-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$BATTERY_LOG") 2>&1
 echo "# full transcript: $BATTERY_LOG"
+# Suite provenance stamps the transcript before anything runs; the
+# per-pass daemon provenance (build hash + binary checksum) follows
+# each bring-up.
+SUITE_REV=$(git -C "$DIR" describe --always --dirty 2>/dev/null || echo unknown)
+echo "# suite: $SUITE_REV  invoked: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # --backend <substr>: run only the pass(es) whose matrix label matches.
 # Everything else is recorded as skipped, so the matrix stays complete.
@@ -323,6 +328,20 @@ bringup() {
         OVERALL_FAIL=1
         return 1
     fi
+    # Provenance: a result without it is an anecdote with a
+    # timestamp. Record what actually ran -- the daemon's own
+    # compiled-in build hash (read from the banner the process it
+    # PRINTED, not from any file we assume matches) plus a checksum
+    # of the binary on disk -- next to every pass. The old-ROM trap
+    # is systemic without this: nothing else in the battery proves
+    # the code under test is the code you built.
+    PROV=$(ssh -o ConnectTimeout=10 "$SSH" "
+        h=\$(sed -n 's/.*\[\([0-9a-f]\{6,\}\)\].*/\1/p' /tmp/rvd.log 2>/dev/null | head -1)
+        s=\$( (sha256sum '$DAEMON_BIN'/rvd 2>/dev/null || md5sum '$DAEMON_BIN'/rvd 2>/dev/null) | cut -d' ' -f1 | cut -c1-16)
+        echo \"build=\${h:-unknown} rvd_bin=\${s:-unknown}\"" 2>/dev/null)
+    echo "  provenance: ${PROV:-unavailable} bin_path=$DAEMON_BIN suite=$SUITE_REV"
+    printf '# provenance\t%s\t%s bin_path=%s suite=%s\n' "$CURRENT_TARGET" \
+        "${PROV:-unavailable}" "$DAEMON_BIN" "$SUITE_REV" >>"$MATRIX_FILE"
     # Per-profile memory accounting: headroom differs by an order of
     # magnitude across the fleet (a 64MB SoC carves most of RAM away
     # for rmem/ispmem), so the shape each measurement ran under is
@@ -420,6 +439,8 @@ battery_for_target() {
     echo "================================================================"
     echo "TARGET $name  (SoC $SOC, host $HOST)"
     [ -n "$NOTES" ] && echo "  $NOTES"
+    echo "  config inputs: manifest=$(sha256sum "$conf" 2>/dev/null | cut -c1-12)" \
+        "stock=$([ -f "$STOCK_CONF" ] && sha256sum "$STOCK_CONF" | cut -c1-12 || echo missing)"
     echo "================================================================"
 
     # Shared optional legs, assembled once.

@@ -96,7 +96,21 @@ Options:
                        and diff against the previous calibration to
                        catch bench drift. Needs --ssh + --lights-set;
                        no rtsp URL. Restores auto + full brightness.
-  --light-cal-file <f> store/compare the calibration table here
+  --light-cal-file <f> store/compare the calibration table here; an
+                       append-only <f>.history records every cal and
+                       verify so slow creep shows as a trend
+  --light-verify       fast three-rung check against the stored table
+                       (full scale, the deepest nonzero rung, zero --
+                       the bright span is useless, AE flattens it).
+                       Never rewrites the table: a verify that updates
+                       its own reference absorbs the drift it exists
+                       to catch. Also runs automatically before the
+                       daynight light transitions; on drift those legs
+                       SKIP as a bench fact instead of failing as
+                       camera bugs. Exit 1 on drift.
+  --dusk-budget <s>    dusk transition budget (default 45) -- budgets
+                       are rig-dependent, override when reproducing
+  --dawn-budget <s>    dawn transition budget (default 90)
   --bench-quiesce <c>  run before the daynight cycle: neutralize OTHER
                        bench cameras (their auto-night IR floods the
                        room and fakes a lit scene). --bench-restore
@@ -142,6 +156,7 @@ case "$1" in
 rtsp://*) URL=$1; shift ;;
 --daynight-only) ;;
 --light-cal) ;;
+--light-verify) ;;
 *) echo "error: first argument must be an rtsp:// URL (got: $1)" >&2; exit 2 ;;
 esac
 SUB_URL=""
@@ -194,7 +209,13 @@ LIGHTS_SET_CMD=""
 LIGHTS_RAMP_SECS=24
 LIGHTS_MAX=4095
 LIGHT_CAL=0
+LIGHT_VERIFY=0
 LIGHT_CAL_FILE=""
+# Transition budgets are RIG-dependent (lamp brightness, sensor class,
+# probe cadence all move them); the defaults fit this bench, override
+# per target when reproducing elsewhere.
+DUSK_BUDGET=45
+DAWN_BUDGET=90
 while [ $# -gt 0 ]; do
     case "$1" in
     --sub) SUB_URL=$2; shift 2 ;;
@@ -210,7 +231,10 @@ while [ $# -gt 0 ]; do
     --lights-ramp) LIGHTS_RAMP_SECS=$2; shift 2 ;;
     --lights-max) LIGHTS_MAX=$2; shift 2 ;;
     --light-cal) LIGHT_CAL=1; shift ;;
+    --light-verify) LIGHT_VERIFY=1; shift ;;
     --light-cal-file) LIGHT_CAL_FILE=$2; shift 2 ;;
+    --dusk-budget) DUSK_BUDGET=$2; shift 2 ;;
+    --dawn-budget) DAWN_BUDGET=$2; shift 2 ;;
     --duration) DUR=$2; shift 2 ;;
     --go2rtc) GO2RTC=$2; shift 2 ;;
     --mediamtx) MEDIAMTX=$2; shift 2 ;;
@@ -571,9 +595,26 @@ echo "$trans"'
             DN_SSH "raptorctl ric mode auto" </dev/null | grep -q '"mode":[[:space:]]*"auto"' &&
                 ok "daynight: back to auto" || bad "daynight: back to auto" "verb failed"
 
+            # ── bench preflight: calibrate rarely, verify often ──
+            # Three rungs against the pinned table before any light
+            # transition is trusted. On drift the light legs are
+            # SKIPPED as a bench fact (moved camera, aged strip),
+            # never failed as camera bugs -- and the baseline is
+            # never overwritten by a verify, so slow creep cannot
+            # absorb itself into the reference.
+            DN_LIGHTS_OK=1
+            if [ -n "$LIGHT_CAL_FILE" ] && [ -f "$LIGHT_CAL_FILE" ] && [ -n "$LIGHTS_SET_CMD" ]; then
+                if VDETAIL=$(light_verify_run); then
+                    ok "daynight: bench matches calibration ($VDETAIL)"
+                else
+                    skip "daynight: light transitions (bench drift vs $(basename "$LIGHT_CAL_FILE"), run --light-cal: $VDETAIL)"
+                    DN_LIGHTS_OK=0
+                fi
+            fi
+            if [ "$DN_LIGHTS_OK" = 1 ]; then
             # ── real light transitions ──
             eval "$LIGHTS_ON_CMD" > /dev/null 2>&1
-            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- day 90)
+            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- day "$DAWN_BUDGET")
             case "$R" in
             OK*) ok "daynight: lit room settles to day ($(echo "$R" | cut -d' ' -f2)s)" ;;
             *) bad "daynight: lit room settles to day" "$R" ;;
@@ -581,7 +622,7 @@ echo "$trans"'
 
             dn_lights_change down
             dn_flap_check dusk
-            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- night 45)
+            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- night "$DUSK_BUDGET")
             case "$R" in
             OK*)
                 DUSK_T=$(echo "$R" | cut -d' ' -f2)
@@ -626,7 +667,7 @@ echo "$trans"'
             PROBE_BEFORE=$(DN_SSH "logread 2>/dev/null | grep -c 'ambient probe'" </dev/null)
             dn_lights_change up
             dn_flap_check dawn
-            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- day 90)
+            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- day "$DAWN_BUDGET")
             case "$R" in
             OK*)
                 DAWN_T=$(echo "$R" | cut -d' ' -f2)
@@ -652,7 +693,7 @@ echo "$trans"'
             # stimulus classes (gradual threshold crossing AND abrupt
             # change).
             eval "$LIGHTS_OFF_CMD" > /dev/null 2>&1
-            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- night 45)
+            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- night "$DUSK_BUDGET")
             case "$R" in
             OK*) ok "daynight: second dusk repeats ($(echo "$R" | cut -d' ' -f2)s)" ;;
             *) bad "daynight: second dusk repeats" "$R" ;;
@@ -664,19 +705,20 @@ echo "$trans"'
             DN_SSH "raptorctl ric mode day" </dev/null > /dev/null 2>&1
             sleep 2
             DN_SSH "raptorctl ric mode auto" </dev/null > /dev/null 2>&1
-            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- night 45)
+            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- night "$DUSK_BUDGET")
             case "$R" in
             OK*) ok "daynight: dark re-acquisition after forced day ($(echo "$R" | cut -d' ' -f2)s)" ;;
             *) bad "daynight: dark re-acquisition after forced day" "$R" ;;
             esac
 
             eval "$LIGHTS_ON_CMD" > /dev/null 2>&1
-            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- day 90)
+            R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- day "$DAWN_BUDGET")
             case "$R" in
             OK*) ok "daynight: lights restored, day again ($(echo "$R" | cut -d' ' -f2)s)" ;;
             *) bad "daynight: lights restored, day again" "$R" ;;
             esac
             DN_SSH "raptorctl ric set-threshold probe_recheck_sec 600" </dev/null > /dev/null 2>&1
+            fi
             [ -n "$BENCH_RESTORE_CMD" ] && eval "$BENCH_RESTORE_CMD" > /dev/null 2>&1
         fi
     fi
@@ -892,23 +934,11 @@ bad() {
 # For quick IR/ircut iteration on the bench:
 #   raptor-test --daynight-only --ssh root@cam \
 #       --lights-on '<cmd>' --lights-off '<cmd>'
-light_cal() {
-    # Calibrate the light source against THIS camera: duty is not
-    # light output, and light is not camera signal -- the mapping is
-    # per-rig physics (strip aging, geometry, reflectance) and this
-    # table is its measurement. Forced day keeps the filter and IR
-    # parked so every rung reads pure AE response. The dark rungs are
-    # where the value is: LED forward-voltage cutoff makes the bottom
-    # of the range nonlinear exactly where night thresholds live,
-    # which is why the ladder is raw counts, not percent.
-    if [ -z "$SSH_TARGET" ] || [ -z "$LIGHTS_SET_CMD" ]; then
-        echo "light-cal needs --ssh and --lights-set" >&2
-        exit 2
-    fi
-    LC_SSH() { ssh -o ConnectTimeout=8 "$SSH_TARGET" "$@"; }
-    # Remote: poll until two successive readings agree within 10%
-    # (gain AND luma), cap 8s; print the settled line either way.
-    LC_READ='
+# ── shared light instrumentation (calibration + verification) ──
+LC_SSH() { ssh -o ConnectTimeout=8 "$SSH_TARGET" "$@"; }
+# Remote: poll until two successive readings agree within 10% (gain
+# AND luma), cap 8s; print the settled line either way.
+LC_READ='
 pg=""; pl=""; t0=$(date +%s)
 while :; do
     e=$(raptorctl rvd get-exposure 2>/dev/null)
@@ -926,6 +956,88 @@ while :; do
     [ $(( $(date +%s)-t0 )) -ge 8 ] && { echo "${g:-?} ${l:-?} ${u:-?} ${v:-?}"; exit 0; }
     sleep 1
 done'
+lc_read() { printf '%s\n' "$LC_READ" | LC_SSH sh -s; }
+# Append-only instrument history beside the table: even with a pinned
+# baseline, slow creep is easiest to see as a trend across entries.
+lc_hist() {
+    [ -n "$LIGHT_CAL_FILE" ] &&
+        printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LIGHT_CAL_FILE.history"
+}
+
+# Fast bench verification against the pinned calibration at the three
+# anchor rungs: full scale, the deepest NONZERO rung (the cliff edge,
+# where AE has run out of authority), and ZERO (the dark floor, the
+# strongest signal in the table). A mid-luma rung is deliberately not
+# used: on cliff-shaped rigs the dark zone wobbles flat and "middle"
+# means nothing. Never writes the table (only the history): a verify
+# that updates its own reference absorbs the very drift it exists to
+# catch. Prints a one-line summary; rc 0 = within tolerance.
+light_verify_run() {
+    [ -n "$SSH_TARGET" ] && [ -n "$LIGHTS_SET_CMD" ] &&
+        [ -f "${LIGHT_CAL_FILE:-/nonexistent}" ] || { echo "not configured"; return 1; }
+    set -- $(awk 'BEGIN { n = 0 }
+        $1 ~ /^[0-9]/ && $2 ~ /^[0-9]/ { lv[n]=$1; lm[n]=$2; n++ }
+        END {
+            if (n < 4) exit 1
+            deep = 0; zero = -1
+            for (i = 0; i < n; i++) {
+                if (lv[i]+0 > 0) deep = i
+                if (lv[i]+0 == 0) zero = i
+            }
+            printf "%s:%s %s:%s", lv[0], lm[0], lv[deep], lm[deep]
+            if (zero >= 0) printf " %s:%s", lv[zero], lm[zero]
+            printf "\n"
+        }' "$LIGHT_CAL_FILE") || { echo "unreadable table"; return 1; }
+    local prev_mode drift="" detail="" pair lvl want got tol d
+    prev_mode=$(LC_SSH "raptorctl ric status" </dev/null 2>/dev/null |
+        sed -n 's/.*"mode":"\([a-z]*\)".*/\1/p')
+    LC_SSH "raptorctl ric mode day" </dev/null > /dev/null 2>&1
+    sleep 2
+    for pair in "$@"; do
+        lvl=${pair%%:*}; want=${pair#*:}
+        # shellcheck disable=SC2059
+        eval "$(printf "$LIGHTS_SET_CMD" "$lvl")" > /dev/null 2>&1
+        # Two settle-reads per rung, keep the second: the verify JUMPS
+        # between rungs (calibration walked down gently), and after a
+        # big exposure swing AE steps-and-holds long enough to fool a
+        # single two-sample agreement -- one quiet pair is not settled
+        # (the ric baseline machinery learned this on a gc2053 first).
+        lc_read > /dev/null
+        set -- $(lc_read)
+        got=${2:-?}
+        tol=$((want / 4)); [ "$tol" -lt 6 ] && tol=6
+        d=$((got - want)) 2>/dev/null || d=999
+        [ "$d" -lt 0 ] && d=$((-d))
+        detail="$detail level $lvl: $want->$got"
+        lc_hist "verify level=$lvl stored=$want got=$got tol=$tol"
+        [ "$d" -le "$tol" ] || drift="$drift level $lvl off by $d (tol $tol);"
+    done
+    LC_SSH "raptorctl ric mode ${prev_mode:-auto}" </dev/null > /dev/null 2>&1
+    # shellcheck disable=SC2059
+    eval "$(printf "$LIGHTS_SET_CMD" "$LIGHTS_MAX")" > /dev/null 2>&1
+    if [ -n "$drift" ]; then
+        lc_hist "verify VERDICT=drift$drift"
+        echo "${drift# }"
+        return 1
+    fi
+    lc_hist "verify VERDICT=ok"
+    echo "${detail# }"
+    return 0
+}
+
+light_cal() {
+    # Calibrate the light source against THIS camera: duty is not
+    # light output, and light is not camera signal -- the mapping is
+    # per-rig physics (strip aging, geometry, reflectance) and this
+    # table is its measurement. Forced day keeps the filter and IR
+    # parked so every rung reads pure AE response. The dark rungs are
+    # where the value is: LED forward-voltage cutoff makes the bottom
+    # of the range nonlinear exactly where night thresholds live,
+    # which is why the ladder is raw counts, not percent.
+    if [ -z "$SSH_TARGET" ] || [ -z "$LIGHTS_SET_CMD" ]; then
+        echo "light-cal needs --ssh and --lights-set" >&2
+        exit 2
+    fi
     echo "=== Light-source calibration ($SSH_TARGET, max $LIGHTS_MAX) ==="
     # Same interference rule as the daynight cycle: another bench
     # camera in auto goes night at the dark rungs and its IR floods
@@ -953,7 +1065,7 @@ done'
         [ "$pm" != 0 ] && [ "$LVL" -lt 1 ] && LVL=1
         # shellcheck disable=SC2059
         eval "$(printf "$LIGHTS_SET_CMD" "$LVL")" > /dev/null 2>&1
-        R=$(printf '%s\n' "$LC_READ" | LC_SSH sh -s)
+        R=$(lc_read)
         set -- $R
         printf '%6d %5s %8s %9s %9s\n' "$LVL" "${2:-?}" "${1:-?}" "${3:-?}" "${4:-?}" | tee -a "$NEW"
         if [ -z "$LUMA_CROSS" ] && [ -n "$NL" ] && [ "${2:-999}" != "?" ] &&
@@ -981,6 +1093,7 @@ done'
             fi
         fi
         mv "$NEW" "$LIGHT_CAL_FILE"
+        lc_hist "cal stored crossings: night_luma@${LUMA_CROSS:-none} night_gain@${GAIN_CROSS:-none}"
         echo "calibration stored: $LIGHT_CAL_FILE"
     else
         rm -f "$NEW"
@@ -996,8 +1109,23 @@ if [ "${LIGHT_CAL:-0}" = 1 ]; then
     light_cal
 fi
 
+if [ "${LIGHT_VERIFY:-0}" = 1 ]; then
+    echo "=== Light-source verification ($SSH_TARGET vs ${LIGHT_CAL_FILE:-<no table>}) ==="
+    [ -n "$BENCH_QUIESCE_CMD" ] && eval "$BENCH_QUIESCE_CMD" > /dev/null 2>&1
+    if OUT=$(light_verify_run); then
+        echo "  OK    $OUT"
+        RC=0
+    else
+        echo "  DRIFT $OUT"
+        RC=1
+    fi
+    [ -n "$BENCH_RESTORE_CMD" ] && eval "$BENCH_RESTORE_CMD" > /dev/null 2>&1
+    exit "$RC"
+fi
+
 if [ "${DAYNIGHT_ONLY:-0}" = 1 ]; then
     echo "=== Day/night hardware cycle (solo) ==="
+    echo "    suite: $(git -C "${RAPTOR_TEST_HOME:-.}" describe --always --dirty 2>/dev/null || echo unknown)"
     daynight_cycle
     print_result
 fi
@@ -1086,7 +1214,9 @@ capture() {
     fi
 }
 
+suite_rev() { git -C "${RAPTOR_TEST_HOME:-.}" describe --always --dirty 2>/dev/null || echo unknown; }
 echo "=== raptor-test: $URL ==="
+echo "    suite: $(suite_rev)"
 echo "    client: $("$FFMPEG" -version 2>/dev/null | head -1 | grep -oE 'version [^ ]+' || echo unknown) ($FFMPEG)"
 echo "    logs: $WORK"
 
