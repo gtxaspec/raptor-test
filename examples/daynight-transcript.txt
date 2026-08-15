@@ -1,0 +1,24 @@
+=== Day/night hardware cycle (solo) ===
+  PASS  daynight: ric answering in auto mode
+  PASS  daynight: forced night lights an IR bank (gpio 49)
+  PASS  daynight: mode night forces night
+  PASS  daynight: mode day forces day
+  PASS  daynight: forced day cuts the IR bank
+  PASS  daynight: manual ir850 on/off
+  SKIP  daynight: manual ir940 (no pin on this board)
+  PASS  daynight: manual ircut night/day
+  PASS  daynight: forced day re-asserts perturbed rails
+  PASS  daynight: back to auto
+  PASS  daynight: lit room settles to day (0s)
+  PASS  daynight: dusk ramp crosses the threshold once (1 transition(s))
+  PASS  daynight: dusk reaches night (0s)
+  PASS  daynight: IR emitters light the scene (night luma 69)
+  PASS  daynight: dark hold stable (15 samples, 0 flaps, 0 LED blinks)
+  PASS  daynight: dawn ramp crosses the threshold once (1 transition(s))
+  PASS  daynight: dawn returns to day (0s via ratio)
+  PASS  daynight: dawn leaves the IR bank off
+  PASS  daynight: second dusk repeats (4s)
+  PASS  daynight: dark re-acquisition after forced day (6s)
+  PASS  daynight: lights restored, day again (22s)
+
+=== RESULT: 20 passed, 0 failed, 1 skipped ===

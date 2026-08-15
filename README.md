@@ -128,6 +128,22 @@ listed, logs kept), 2 = usage error.
 | Clips | Recorded files: streams present, durations aligned, full decode with zero errors (null-muxer dts nag and its repeat-tails excluded; file-level dts asserted to never move backward instead) |
 | Device | (`--ssh`) rsd CPU sane after the suite, connection count back at the pre-suite baseline, daemon log lines emitted during the run free of ERROR-level entries and crashes, framesource "losted buffers" counters flat across the run |
 
+## Day/night hardware cycle, ramps and light calibration
+
+Targets with a scriptable room light unlock the `--daynight`
+hardware cycle: forced-mode rail assertions, real dusk/dawn
+transitions, an IR-lit dark hold, and — with a dimmable light
+(`--lights-set`) — log-spaced dusk/dawn ramps carrying a hysteresis
+assertion (the threshold region must be crossed exactly once under a
+monotonic dim; a step change can never test that). `--light-cal`
+characterizes the lamp against the camera's own AE and thresholds,
+`--light-verify` re-checks three rungs against the pinned table every
+session so bench drift is caught as a bench fact, and the daynight
+ramps derive their rungs from the stored table. **`BENCH.md` is the
+full reproduction guide** — minimum hardware, manifest wiring,
+methodology order, provenance, and how to quote numbers;
+`examples/` holds sanitized real artifacts.
+
 ## Self-tests
 
 The suite tests itself, because a conformance suite that never fails
