@@ -243,18 +243,27 @@ def main():
     srv.bind(("127.0.0.1", PORT))
     srv.listen(4)
     print(f"evil_server mode={MODE} port={PORT} frames={len(FRAMES)}", flush=True)
+    # One thread per connection: real servers accept concurrently, and
+    # rfc_check's transport-spec probes open a second connection while
+    # the main one is held. Serial accept left that probe in the
+    # backlog until it timed out and (before it was hardened) killed
+    # the whole probe -- the fixture must not model a misbehavior no
+    # mode asked for.
     while True:
         try:
             conn, _ = srv.accept()
         except KeyboardInterrupt:
             return
-        try:
-            handle(conn)
-        except Exception:
-            pass
-        finally:
-            conn.close()
-            time.sleep(0.05)
+        threading.Thread(target=serve_one, args=(conn,), daemon=True).start()
+
+
+def serve_one(conn):
+    try:
+        handle(conn)
+    except Exception:
+        pass
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

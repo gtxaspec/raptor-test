@@ -218,20 +218,33 @@ primary_url = vurl if "video" in track_url or not track_url else aurl
 #    is torn down immediately -- this is about the SETUP answer only. --
 for spec in ("RTP/AVP;unicast;client_port=41000-41001",
              "RTP/AVP/UDP;unicast;client_port=41002-41003"):
-    probe = socket.create_connection((host, port), timeout=6)
-    _s, _c, _sock = s, cseq, probe
-    s, cseq = probe, 0
-    head, _, _ = req("SETUP", primary_url, f"Transport: {spec}\r\n")
-    code = head.split("\r\n")[0]
-    tsess = None
-    for ln in head.split("\r\n"):
-        if ln.lower().startswith("session"):
-            tsess = ln.split(":")[1].split(";")[0].strip()
-    if tsess:
-        req("TEARDOWN", url, f"Session: {tsess}\r\n")
-    probe.close()
-    s, cseq = _s, _c
-    emit("200" in code, f"RFC2326 12.39 SETUP accepts {spec.split(';')[0]}", code)
+    # A crash here is a probe bug, not a finding: an unanswered SETUP
+    # must FAIL this one check, never take down the whole probe -- an
+    # uncaught timeout silently loses every check after this point
+    # (this exact hole hid the robustness battery for two weeks).
+    _s, _c = s, cseq
+    probe = None
+    try:
+        probe = socket.create_connection((host, port), timeout=6)
+        s, cseq = probe, 0
+        head, _, _ = req("SETUP", primary_url, f"Transport: {spec}\r\n")
+        code = head.split("\r\n")[0]
+        tsess = None
+        for ln in head.split("\r\n"):
+            if ln.lower().startswith("session"):
+                tsess = ln.split(":")[1].split(";")[0].strip()
+        if tsess:
+            req("TEARDOWN", url, f"Session: {tsess}\r\n")
+        emit("200" in code, f"RFC2326 12.39 SETUP accepts {spec.split(';')[0]}", code)
+    except OSError as e:
+        emit(False, f"RFC2326 12.39 SETUP accepts {spec.split(';')[0]}", f"no answer: {e}")
+    finally:
+        if probe is not None:
+            try:
+                probe.close()
+            except OSError:
+                pass
+        s, cseq = _s, _c
 
 # -- SETUP both tracks, PLAY, RTP-Info --
 sess = None
