@@ -94,21 +94,52 @@ def main():
             dr = ((r2 - r1 + 2**31) % 2**32 - 2**31) / rate
             if dn > 0.5:
                 sr_ppms.append(round((dr / dn - 1.0) * 1e6, 1))
-        # Whole-window media-clock rate vs the device wall clock, from
-        # the first and last SR of the capture: the longest lever the
-        # window offers (adjacent pairs are ~5s and 1ms of mapping
-        # noise there is already 200ppm). Framing-independent and
-        # host-clock-independent, which the wire slope is not -- this
-        # is the drift number that stays measurable for codecs whose
-        # packet spacing rides an availability grid (AAC).
+        # Whole-window media-clock rate vs the device wall clock, over
+        # the STEADY SRs. Framing-independent and host-clock-
+        # independent, which the wire slope is not -- this is the
+        # drift number that stays measurable for codecs whose packet
+        # spacing rides an availability grid (AAC).
+        #
+        # A first-to-last SR pair looked like the longest lever, but
+        # it inherits whatever its two endpoints carry whole: the
+        # first SRs are the session-start anchoring noise
+        # steady_spread_ms already skips, and one resync-class
+        # excursion landing on an endpoint reads as phantom rate
+        # error (a ~20ms anchor over a 35s window is ~550ppm that a
+        # 1-2ms steady spread plainly contradicts -- caught as an
+        # intermittent battery FAIL). So: least-squares over the
+        # steady region, and the leg's excise-one convention applied
+        # as residuals -- one resync-class point (>5ms off the fit)
+        # is dropped and the fit rerun; a systematic defect survives.
+        def rate_fit(pts):
+            if len(pts) < 2 or pts[-1][0] - pts[0][0] <= 5.0:
+                return None, None
+            fmx = sum(x for x, _ in pts) / len(pts)
+            fmy = sum(y for _, y in pts) / len(pts)
+            fden = sum((x - fmx) ** 2 for x, _ in pts)
+            if not fden:
+                return None, None
+            slope = sum((x - fmx) * (y - fmy) for x, y in pts) / fden
+            res = [y - (fmy + slope * (x - fmx)) for x, y in pts]
+            return slope, res
+
         window_ppm = None
-        if len(srs[rtcp_ch]) >= 2:
-            _, n1, r1 = srs[rtcp_ch][0]
-            _, n2, r2 = srs[rtcp_ch][-1]
-            dn = n2 - n1
-            dr = ((r2 - r1 + 2**31) % 2**32 - 2**31) / rate
-            if dn > 5.0:
-                window_ppm = round((dr / dn - 1.0) * 1e6, 1)
+        steady = srs[rtcp_ch][2:]
+        if len(steady) >= 2:
+            n0, r0 = steady[0][1], steady[0][2]
+            pts = [(s[1] - n0,
+                    ((s[2] - r0 + 2**31) % 2**32 - 2**31) / rate)
+                   for s in steady]
+            slope, res = rate_fit(pts)
+            if res is not None:
+                worst = max(range(len(res)), key=lambda i: abs(res[i]))
+                if abs(res[worst]) > 0.005:
+                    slope2, _ = rate_fit(
+                        [p for i, p in enumerate(pts) if i != worst])
+                    if slope2 is not None:
+                        slope = slope2
+            if slope is not None:
+                window_ppm = round((slope - 1.0) * 1e6, 1)
         rel = [round((o - ntp_off[0]) * 1000, 3) for o in ntp_off]
         rel_arr = [round((o - arr_off[0]) * 1000, 3) for o in arr_off]
         steps = [round(b - a, 3) for a, b in zip(rel, rel[1:])]
