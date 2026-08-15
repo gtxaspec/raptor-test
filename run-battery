@@ -388,6 +388,9 @@ battery_for_target() {
     RTSP_PORT=554; PATH0=stream0; PATH1=stream1
     R555_PORT=''; R555_PATH0=stream0; R555_PATH1=stream1
     GO2RTC=''; MEDIAMTX=''; FRIGATE=no; RECORD_CHECK=''; NOTES=''; GOP=''
+    # Lights/bench commands must not leak between targets under --all
+    LIGHTS_ON_CMD=''; LIGHTS_OFF_CMD=''; LIGHTS_SET_CMD=''; LIGHTS_RAMP_SECS=''
+    BENCH_QUIESCE_CMD=''; BENCH_RESTORE_CMD=''
     TLS=''; RTMP=''; WEBRTC=''
     # Daemon profiles (opt-in; empty DAEMONS_BASE = manage nothing)
     DAEMON_BIN=''; DAEMONS_BASE=''; DAEMONS_RECORD=''
@@ -461,6 +464,8 @@ battery_for_target() {
     # attached to the main pass. Needs ssh to reach raptorctl.
     if [ -n "${LIGHTS_ON_CMD:-}" ] && [ -n "${LIGHTS_OFF_CMD:-}" ] && [ -n "$SSH" ]; then
         rsd_args+=(--daynight --lights-on "$LIGHTS_ON_CMD" --lights-off "$LIGHTS_OFF_CMD")
+        [ -n "${LIGHTS_SET_CMD:-}" ] && rsd_args+=(--lights-set "$LIGHTS_SET_CMD")
+        [ -n "${LIGHTS_RAMP_SECS:-}" ] && rsd_args+=(--lights-ramp "$LIGHTS_RAMP_SECS")
         [ -n "${BENCH_QUIESCE_CMD:-}" ] && rsd_args+=(--bench-quiesce "$BENCH_QUIESCE_CMD")
         [ -n "${BENCH_RESTORE_CMD:-}" ] && rsd_args+=(--bench-restore "$BENCH_RESTORE_CMD")
     fi

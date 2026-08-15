@@ -74,6 +74,15 @@ Options:
                        documented a key that gated nothing).
   --lights-on <cmd>    shell command that turns the room lights on
   --lights-off <cmd>   shell command that turns the room lights off
+  --lights-set <cmd>   printf template with exactly one %d (percent
+                       0-100) that sets the room light level. Enables
+                       RAMPED dusk/dawn in the daynight cycle: the
+                       first dusk and the dawn walk a log-spaced ramp
+                       (equal-ratio steps = equal exposure steps to a
+                       logarithmic AE) while the camera's state is
+                       watched for flapping; the second dusk stays a
+                       step so both stimulus classes run every cycle
+  --lights-ramp <s>    ramp duration in seconds (default 24)
   --bench-quiesce <c>  run before the daynight cycle: neutralize OTHER
                        bench cameras (their auto-night IR floods the
                        room and fakes a lit scene). --bench-restore
@@ -166,6 +175,8 @@ BENCH_QUIESCE_CMD=""
 BENCH_RESTORE_CMD=""
 LIGHTS_ON_CMD=""
 LIGHTS_OFF_CMD=""
+LIGHTS_SET_CMD=""
+LIGHTS_RAMP_SECS=24
 while [ $# -gt 0 ]; do
     case "$1" in
     --sub) SUB_URL=$2; shift 2 ;;
@@ -177,6 +188,8 @@ while [ $# -gt 0 ]; do
     --daynight-only) DAYNIGHT=1; DAYNIGHT_ONLY=1; shift ;;
     --lights-on) LIGHTS_ON_CMD=$2; shift 2 ;;
     --lights-off) LIGHTS_OFF_CMD=$2; shift 2 ;;
+    --lights-set) LIGHTS_SET_CMD=$2; shift 2 ;;
+    --lights-ramp) LIGHTS_RAMP_SECS=$2; shift 2 ;;
     --duration) DUR=$2; shift 2 ;;
     --go2rtc) GO2RTC=$2; shift 2 ;;
     --mediamtx) MEDIAMTX=$2; shift 2 ;;
@@ -359,6 +372,61 @@ while [ $(( $(date +%s)-t0 )) -lt "$secs" ]; do
 done
 echo "$n $flaps $ledoff"'
         DN_LEDVALS='for p in "$@"; do cat /sys/class/gpio/gpio"$p"/value 2>/dev/null || echo "?"; done'
+        # Remote: watch for state changes over N seconds, print the
+        # transition count. Feeds the ramp hysteresis assertion: a slow
+        # crossing of the threshold region must switch exactly once --
+        # flapping under a monotonic dim is precisely what the
+        # hysteresis/debounce machinery exists to prevent, and a step
+        # change can never test it.
+        DN_FLAPWATCH='
+secs=$1; t0=$(date +%s); prev=""; trans=0
+while [ $(( $(date +%s)-t0 )) -lt "$secs" ]; do
+    st=$(raptorctl ric status 2>/dev/null | sed -n "s/.*\"state\":\"\([a-z]*\)\".*/\1/p")
+    [ -n "$st" ] && [ -n "$prev" ] && [ "$st" != "$prev" ] && trans=$((trans+1))
+    [ -n "$st" ] && prev=$st
+    sleep 2
+done
+echo "$trans"'
+        # Log-spaced levels: camera AE is logarithmic, so equal-RATIO
+        # steps are equal exposure steps. A linear duty ramp sprints
+        # through the dark end where the night threshold actually
+        # lives and dawdles at the bright end where nothing happens.
+        DN_RAMP_LEVELS="100 64 40 25 16 10 6 4 2 1 0"
+        dn_ramp() { # down|up: walk LIGHTS_SET_CMD over the schedule
+            local levels="$DN_RAMP_LEVELS" l pause n
+            [ "$1" = up ] && levels=$(printf '%s\n' $DN_RAMP_LEVELS | tac | tr '\n' ' ')
+            n=$(echo "$levels" | wc -w)
+            pause=$(awk -v d="$LIGHTS_RAMP_SECS" -v n="$n" 'BEGIN{printf "%.2f", d/n}')
+            for l in $levels; do
+                # shellcheck disable=SC2059  # the template IS a format string
+                eval "$(printf "$LIGHTS_SET_CMD" "$l")" > /dev/null 2>&1
+                sleep "$pause"
+            done
+        }
+        dn_lights_change() { # down|up: ramp when a template exists, else step
+            if [ -n "$LIGHTS_SET_CMD" ]; then
+                dn_ramp "$1" &
+                DN_RPID=$!
+                DN_FLAPS=$(printf '%s\n' "$DN_FLAPWATCH" | DN_SSH sh -s -- "$LIGHTS_RAMP_SECS")
+                wait "$DN_RPID"
+            else
+                DN_FLAPS=""
+                if [ "$1" = down ]; then
+                    eval "$LIGHTS_OFF_CMD" > /dev/null 2>&1
+                else
+                    eval "$LIGHTS_ON_CMD" > /dev/null 2>&1
+                fi
+            fi
+        }
+        dn_flap_check() { # <label>: at most one transition during a ramp
+            [ -z "$DN_FLAPS" ] && return 0
+            if [ "${DN_FLAPS:-0}" -le 1 ] 2>/dev/null; then
+                ok "daynight: $1 ramp crosses the threshold once ($DN_FLAPS transition(s))"
+            else
+                bad "daynight: $1 ramp crosses the threshold once" \
+                    "$DN_FLAPS transitions during a monotonic ramp -- flapping"
+            fi
+        }
 
         DN_STATUS=$(DN_SSH "raptorctl ric status" 2>/dev/null)
         if ! echo "$DN_STATUS" | grep -q '"state"'; then
@@ -459,7 +527,8 @@ echo "$n $flaps $ledoff"'
             *) bad "daynight: lit room settles to day" "$R" ;;
             esac
 
-            eval "$LIGHTS_OFF_CMD" > /dev/null 2>&1
+            dn_lights_change down
+            dn_flap_check dusk
             R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- night 45)
             case "$R" in
             OK*)
@@ -503,7 +572,8 @@ echo "$n $flaps $ledoff"'
             # run at the default cadence to stay a pure false-blink detector.
             DN_SSH "raptorctl ric set-threshold probe_recheck_sec 20" </dev/null > /dev/null 2>&1
             PROBE_BEFORE=$(DN_SSH "logread 2>/dev/null | grep -c 'ambient probe'" </dev/null)
-            eval "$LIGHTS_ON_CMD" > /dev/null 2>&1
+            dn_lights_change up
+            dn_flap_check dawn
             R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- day 90)
             case "$R" in
             OK*)
@@ -525,6 +595,10 @@ echo "$n $flaps $ledoff"'
             *) bad "daynight: dawn returns to day" "$R" ;;
             esac
 
+            # Second dusk stays a STEP on purpose: with --lights-set the
+            # first dusk and the dawn ramp, so one cycle exercises both
+            # stimulus classes (gradual threshold crossing AND abrupt
+            # change).
             eval "$LIGHTS_OFF_CMD" > /dev/null 2>&1
             R=$(printf '%s\n' "$DN_WAIT" | DN_SSH sh -s -- night 45)
             case "$R" in
