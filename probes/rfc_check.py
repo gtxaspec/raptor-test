@@ -97,6 +97,31 @@ public = next((ln for ln in head.split("\r\n") if ln.lower().startswith("public"
 need = [m for m in ("DESCRIBE", "SETUP", "PLAY", "TEARDOWN") if m not in public]
 emit(not need, "RFC2326 OPTIONS Public lists core methods", public or "no Public header")
 
+# -- RFC 2326 12.32: Require negotiation --
+# A tag the server cannot honor draws 551 with the tag named in an
+# Unsupported header. A server that ignores the header instead (some
+# legacy stacks do) gets an honest skip: the client-side fallback
+# still works there, it just never learns why.
+head, _, _ = req("DESCRIBE", url, "Require: org.example.no-such-feature\r\n")
+line0 = head.split("\r\n")[0]
+if " 551 " in line0 + " ":
+    uns = next((ln for ln in head.split("\r\n")
+                if ln.lower().startswith("unsupported")), "")
+    emit("no-such-feature" in uns,
+         "RFC2326 unsupported Require draws 551 naming the tag",
+         uns or "551 without an Unsupported header")
+else:
+    print("SKIP RFC2326 Require negotiation -- server ignores the header ("
+          + line0 + ")", flush=True)
+
+# -- RFC 2326 10.9: SET_PARAMETER keepalive --
+head, _, _ = req("SET_PARAMETER", url)
+line0 = head.split("\r\n")[0]
+if " 200 " in line0 + " ":
+    emit(True, "RFC2326 SET_PARAMETER keepalive answers 200", line0)
+else:
+    print("SKIP RFC2326 SET_PARAMETER keepalive -- " + line0, flush=True)
+
 # -- DESCRIBE + RFC 4566 SDP lints --
 head, sdp, _ = req("DESCRIBE", url, "Accept: application/sdp\r\n")
 emit("200" in head.split("\r\n")[0], "RFC2326 DESCRIBE 200", head.split("\r\n")[0])
