@@ -58,4 +58,12 @@ if [ ! -x webrtc-venv/bin/python ]; then
     python3 -m venv webrtc-venv
     ./webrtc-venv/bin/pip install --quiet 'aiortc==1.15.*' 'av==17.*' 'aiohttp==3.*'
 fi
+# aiortc's stock video jitter buffer holds 128 packets (~150KB of FU-A
+# fragments): a larger frame can never reassemble, so the decoder sees
+# invalid data on every main-stream keyframe while packetsLost stays 0
+# and the probe reads a healthy stream as zero frames. Browsers have no
+# such ceiling. Raise the ring so the probe can judge main streams.
+# Idempotent; runs on existing venvs too.
+sed -i 's/JitterBuffer(capacity=128, is_video=True)/JitterBuffer(capacity=4096, is_video=True)/' \
+    webrtc-venv/lib/python3*/site-packages/aiortc/rtcrtpreceiver.py
 ./webrtc-venv/bin/python -c "import aiortc; print('aiortc', aiortc.__version__)"
