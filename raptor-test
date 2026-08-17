@@ -54,6 +54,7 @@ Options:
   --fuzz               throw malformed RTSP at the server, assert it survives
   --cold               RHD cold-start snapshots (adds ~55s idle; needs --rhd)
   --producer-restart   restart the ring producer mid-stream, assert recovery
+  --restart-recovery   live set-resolution under load, assert recovery
   --clock-step         step the camera clock mid-stream, assert the media
                        timeline survives it (needs --ssh)
                        (needs --ssh; disruptive, so it runs last)
@@ -190,6 +191,7 @@ TLS_URL=""
 RTMP_PORT=""
 WEBRTC_URL=""
 WEBRTC_MAIN=""
+RESTART_RES=0
 GOP_EXPECT=""
 SOAK_MIN=""
 CORE=0
@@ -273,6 +275,7 @@ while [ $# -gt 0 ]; do
     --fuzz) FUZZ=1; shift ;;
     --cold) COLD=1; shift ;;
     --producer-restart) RESTART=1; shift ;;
+    --restart-recovery) RESTART_RES=1; shift ;;
     --clock-step) CLOCKSTEP=1; shift ;;
     --json) JSON_FILE=$2; shift 2 ;;
     --fps-tol) FPS_TOL=$2; shift 2 ;;
@@ -942,6 +945,70 @@ if [ "$RESTART" = 1 ] && [ -n "$SSH_TARGET" ]; then
     fi
 elif [ "$RESTART" = 1 ]; then
     skip "producer restart (--ssh not given)"
+fi
+
+# ── 12b. Live set-resolution (--restart-recovery, needs --ssh): flip
+#       stream0 down and back up while clients stream. The up-flip
+#       raises the refmode stride mid-life — the exact seam the
+#       ENOSPC skip-storms and the region-swap bugs shipped through,
+#       and the one no leg exercised: the harness that validated the
+#       region remap was session-local and never landed. The URL must
+#       be the main stream. With --webrtc-main and the venv present, a
+#       WebRTC session must RIDE THROUGH both flips clean — rwd's send
+#       queue absorbing two encoder restarts is the storm detector. ──
+if [ "$RESTART_RES" = 1 ] && [ -n "$SSH_TARGET" ]; then
+    R0=$(timeout -k 5 15 "$FFPROBE" -v error -rtsp_transport tcp -select_streams v \
+        -show_entries stream=width,height -of csv=p=0 "$URL" 2>/dev/null | head -1)
+    W0=${R0%,*}; H0=${R0#*,}
+    if [ -z "$W0" ] || [ -z "$H0" ] || [ "$W0" = "$R0" ]; then
+        skip "set-resolution recovery (could not read current dimensions)"
+    else
+        DW=$(( (W0 / 2) & ~1 )); DH=$(( (H0 / 2) & ~1 ))
+        WRTCR_PID=""
+        if [ -n "$WEBRTC_MAIN" ] && [ -x "$DIR/tools/webrtc-venv/bin/python" ]; then
+            timeout -k 5 55 "$DIR/tools/webrtc-venv/bin/python" \
+                "$PROBES/webrtc_check.py" "$WEBRTC_MAIN" \
+                "${RTSP_USER:-}" "${RTSP_PASS:-}" 35 0 1 \
+                >"$WORK/webrtc-restart.txt" 2>&1 &
+            WRTCR_PID=$!
+            sleep 6
+        fi
+        resres_probe() { # expect_w expect_h label
+            local i row w f
+            for i in $(seq 10); do
+                row=$(timeout -k 5 12 "$FFPROBE" -v error -rtsp_transport tcp \
+                    -select_streams v -count_frames -read_intervals "%+3" \
+                    -show_entries stream=width,nb_read_frames -of csv=p=0 \
+                    "$URL" 2>/dev/null | head -1)
+                w=${row%,*}; f=${row##*,}
+                if [ "$w" = "$1" ] && [ "${f:-0}" -gt 20 ] 2>/dev/null; then
+                    ok "set-resolution: serves ${1}x$2 (+$f frames) after $3"
+                    return 0
+                fi
+                sleep 2
+            done
+            bad "set-resolution $3" "wanted ${1}x$2 streaming, last saw '${row:-nothing}'"
+            return 1
+        }
+        ssh -o ConnectTimeout=8 "$SSH_TARGET" "raptorctl rvd set-resolution 0 $DW $DH" >/dev/null 2>&1
+        resres_probe "$DW" "$DH" "downsize"
+        # Up-flip ALWAYS runs — it is both the stride-raise under test
+        # and the restore of the deployment resolution.
+        ssh -o ConnectTimeout=8 "$SSH_TARGET" "raptorctl rvd set-resolution 0 $W0 $H0" >/dev/null 2>&1
+        resres_probe "$W0" "$H0" "stride raise"
+        if [ -n "$WRTCR_PID" ]; then
+            wait "$WRTCR_PID" 2>/dev/null
+            if grep -q "OK WebRTC video stability" "$WORK/webrtc-restart.txt" &&
+               ! grep -q "^FAIL" "$WORK/webrtc-restart.txt"; then
+                ok "WebRTC session rides through both encoder restarts clean"
+            else
+                bad "WebRTC across set-resolution" \
+                    "$(grep "^FAIL" "$WORK/webrtc-restart.txt" | head -1)"
+            fi
+        fi
+    fi
+elif [ "$RESTART_RES" = 1 ]; then
+    skip "set-resolution recovery (--ssh not given)"
 fi
 }
 bad() {

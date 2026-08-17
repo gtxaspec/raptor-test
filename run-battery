@@ -402,7 +402,7 @@ battery_for_target() {
     fi
     # Reset every field so a sparse conf can't inherit the previous
     # target's values (matters for --all).
-    SOC=''; HOST=''; HOST6=''; SSH=''; SRT=''; SRT_PASS=''; RHD=''; USER=''; PASS=''; WEBRTC_MAIN=''
+    SOC=''; HOST=''; HOST6=''; SSH=''; SRT=''; SRT_PASS=''; RHD=''; USER=''; PASS=''; WEBRTC_MAIN=''; DRIFT_PASS=''
     SIGN_PASS=''
     RTSP_PORT=554; PATH0=stream0; PATH1=stream1
     R555_PORT=''; R555_PATH0=stream0; R555_PATH1=stream1
@@ -476,7 +476,7 @@ battery_for_target() {
     # Both legs deliberately disturb the stream, so they run last
     # inside this pass, and every later pass brings its daemons up
     # from scratch anyway. They need ssh to reach the device.
-    [ -n "$SSH" ]  && rsd_args+=(--clock-step --producer-restart)
+    [ -n "$SSH" ]  && rsd_args+=(--clock-step --producer-restart --restart-recovery)
     # Malformed-input robustness against the real device parser. The
     # flag existed and the battery never passed it, so every run has
     # been reporting a clean matrix with the fuzzer sitting out.
@@ -526,7 +526,7 @@ battery_for_target() {
     # minus SRT/RHD (those are backend-independent, covered above).
     if [ -n "$R555_PORT" ]; then
         local -a r555_args=()
-        [ -n "$SSH" ]        && r555_args+=(--ssh "$SSH")
+        [ -n "$SSH" ]        && r555_args+=(--ssh "$SSH" --restart-recovery)
         [ -n "$USER" ]       && r555_args+=(--user "$USER" --pass "$PASS")
         [ -n "$GO2RTC" ]     && r555_args+=(--go2rtc "$GO2RTC")
         [ -n "$MEDIAMTX" ]   && r555_args+=(--mediamtx "$MEDIAMTX")
@@ -1001,6 +1001,38 @@ if offs:
     else
         printf '%s\t%s\tn/a (rlatency tool or ssh unavailable)\n' "$name" \
             "sr-wallclock (rlatency)" >>"$MATRIX_FILE"
+    fi
+
+    # Clock-truth pass (DRIFT_PASS=1 + ssh): inject +300ppm of kernel
+    # frequency and fit the receiver-projected a/v skew from SR content
+    # (tools/drift-leg.sh). A frozen media-to-monotonic offset fails in
+    # 3 minutes; the plain SR-coherence spread is blind to this class.
+    # Dead last on purpose: it stops ntpd and skews the clock for ~5
+    # minutes, which nothing wall-clock-sensitive may share. Needs
+    # tools/freqadj.mips (build from freqadj.c with the raptor
+    # toolchain); the leg SKIPs cleanly without it.
+    if [ -n "$DRIFT_PASS" ] && [ -n "$SSH" ] && [ -n "$DAEMONS_BASE" ]; then
+        BRINGUP_LABEL="drift (SR clock truth)"
+        if bringup "$RTSP_PORT" "${base_set[@]}" $DAEMONS_RTSP; then
+            local drift_out drift_rc drift_sum
+            drift_out=$("$DIR/tools/drift-leg.sh" "$HOST" "$RTSP_PORT" "$PATH0" \
+                "$USER" "$PASS" "$SSH" 300 180 30 2>&1)
+            drift_rc=$?
+            echo "$drift_out" | tail -4
+            drift_sum=$(echo "$drift_out" | grep -E "^(OK|FAIL|SKIP) drift-leg" | tail -1)
+            case $drift_rc in
+            0) printf '%s\t%s\t%s\n' "$name" "drift (SR clock truth)" \
+                "${drift_sum:-PASS}" >>"$MATRIX_FILE" ;;
+            2) printf '%s\t%s\tskip: %s\n' "$name" "drift (SR clock truth)" \
+                "${drift_sum:-no result}" >>"$MATRIX_FILE" ;;
+            *) printf '%s\t%s\t%s\n' "$name" "drift (SR clock truth)" \
+                "${drift_sum:-FAIL}" >>"$MATRIX_FILE"
+               OVERALL_FAIL=1 ;;
+            esac
+        fi
+    elif [ -n "$DRIFT_PASS" ]; then
+        printf '%s\t%s\tn/a (needs ssh + daemon profile)\n' "$name" \
+            "drift (SR clock truth)" >>"$MATRIX_FILE"
     fi
 }
 
