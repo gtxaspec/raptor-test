@@ -402,7 +402,7 @@ battery_for_target() {
     fi
     # Reset every field so a sparse conf can't inherit the previous
     # target's values (matters for --all).
-    SOC=''; HOST=''; HOST6=''; SSH=''; SRT=''; SRT_PASS=''; RHD=''; USER=''; PASS=''
+    SOC=''; HOST=''; HOST6=''; SSH=''; SRT=''; SRT_PASS=''; RHD=''; USER=''; PASS=''; WEBRTC_MAIN=''
     SIGN_PASS=''
     RTSP_PORT=554; PATH0=stream0; PATH1=stream1
     R555_PORT=''; R555_PATH0=stream0; R555_PATH1=stream1
@@ -501,6 +501,7 @@ battery_for_target() {
     [ -n "$TLS" ]  && rsd_args+=(--tls "$TLS")
     [ -n "$RTMP" ] && rsd_args+=(--rtmp "$RTMP")
     [ -n "$WEBRTC" ] && rsd_args+=(--webrtc "$WEBRTC")
+    [ -n "${WEBRTC_MAIN:-}" ] && rsd_args+=(--webrtc-main "$WEBRTC_MAIN")
     # This pass's daemons: base + rsd + whichever extra backends its
     # legs exercise. Multi-protocol coexistence is a real deployment;
     # two RTSP backends at once is not, so rsd-555 is excluded here and
@@ -563,11 +564,42 @@ battery_for_target() {
         # exactly where sprop/marker/AU bugs surface.
         [ -n "$GO2RTC" ]   && h265_args+=(--go2rtc "$GO2RTC")
         [ -n "$MEDIAMTX" ] && h265_args+=(--mediamtx "$MEDIAMTX")
+        [ -n "$SRT" ]      && h265_args+=(--srt "$SRT")
+        [ -n "$SRT_PASS" ] && h265_args+=(--srt-passphrase "$SRT_PASS")
         BRINGUP_LABEL="h265 (sub stream)"
         local saved_conf=$CONF_SET
         CONF_SET="$CONF_SET stream1.codec=h265"
-        if BRINGUP_RINGS="main sub" bringup "$RTSP_PORT" "${base_set[@]}" $DAEMONS_RTSP; then
+        local -a p265=("${base_set[@]}" $DAEMONS_RTSP)
+        [ -n "$SRT" ] && p265+=($DAEMONS_SRT)
+        if BRINGUP_RINGS="main sub" bringup "$RTSP_PORT" "${p265[@]}"; then
             run_suite "h265 (sub stream)" "rtsp://$HOST:$RTSP_PORT/$PATH1" "${h265_args[@]}"
+        fi
+        CONF_SET=$saved_conf
+
+        # H.265 on the MAIN stream. The sub-flip pass keeps main at
+        # H.264 by design, which also means HEVC never rides the
+        # full-size frames where the refmode copy budget and every
+        # size-dependent bug actually live (the rwd main-stream storm
+        # shipped precisely because nothing pulled main at real frame
+        # sizes). Same suite against PATH0 with stream0 flipped and the
+        # sub left at H.264, so a working H.264 endpoint survives this
+        # pass too. rsd-555 rides along: its only other coverage is
+        # H.264 main.
+        BRINGUP_LABEL="h265 (main stream)"
+        saved_conf=$CONF_SET
+        CONF_SET="$CONF_SET stream0.codec=h265"
+        if BRINGUP_RINGS="main sub" bringup "$RTSP_PORT" "${p265[@]}"; then
+            run_suite "h265 (main stream)" "rtsp://$HOST:$RTSP_PORT/$PATH0" "${h265_args[@]}"
+        fi
+        if [ -n "$R555_PORT" ]; then
+            local -a h265_555=(--core)
+            [ -n "$SSH" ]  && h265_555+=(--ssh "$SSH")
+            [ -n "$USER" ] && h265_555+=(--user "$USER" --pass "$PASS")
+            BRINGUP_LABEL="h265 main (rsd-555)"
+            if BRINGUP_RINGS="main sub" bringup "$R555_PORT" "${base_set[@]}" $DAEMONS_R555; then
+                run_suite "h265 main (rsd-555)" \
+                    "rtsp://$HOST:$R555_PORT/$R555_PATH0" "${h265_555[@]}"
+            fi
         fi
         CONF_SET=$saved_conf
     else
