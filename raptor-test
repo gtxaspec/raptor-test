@@ -3321,6 +3321,23 @@ if [ -n "$WEBRTC_URL" ]; then
         elif [ -n "${SPKPID:-}" ]; then
             wait "$SPKPID" 2>/dev/null
         fi
+        # Main-stream pass (WEBRTC_MAIN= in the target, H264 mains only):
+        # the sub-only leg left rwd's main path untested for months while
+        # it could not hold the refmode copy budget at real frame sizes.
+        # Keyframes here are hundreds of KB — needs the fetch-tools
+        # jitter-buffer patch in the venv to judge fairly.
+        if [ -n "${WEBRTC_MAIN:-}" ]; then
+            WRTCM=$(timeout -k 5 45 "$WVENV" "$PROBES/webrtc_check.py" "$WEBRTC_MAIN" \
+                "${RTSP_USER:-}" "${RTSP_PASS:-}" 12 0 1 2>&1)
+            echo "$WRTCM" >"$WORK/webrtc-main.txt"
+            while IFS= read -r line; do
+                case $line in
+                    OK\ *)   ok "${line#OK } [main]" ;;
+                    FAIL\ *) bad "${line#FAIL } [main]" ;;
+                    SKIP\ *) skip "${line#SKIP } [main]" ;;
+                esac
+            done <<< "$WRTCM"
+        fi
     else
         skip "WebRTC leg (tools/webrtc-venv missing — run tools/fetch-tools.sh)"
     fi
